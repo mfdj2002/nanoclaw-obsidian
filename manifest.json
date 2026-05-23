@@ -1,0 +1,9 @@
+{
+  "id": "nanoclaw-chat",
+  "name": "Nanoclaw Chat",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Chat with your local nanoclaw agent (DeepSeek + memory) through its cli.sock — a paste-friendly sidebar instead of the terminal.",
+  "author": "kite",
+  "isDesktopOnly": true
+}

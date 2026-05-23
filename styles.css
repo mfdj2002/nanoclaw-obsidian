@@ -1,0 +1,93 @@
+.nanoclaw-chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+.nanoclaw-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  overflow-x: auto;
+}
+.nanoclaw-tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 12px;
+  user-select: none;
+}
+.nanoclaw-tab.active {
+  background: var(--background-modifier-hover);
+  font-weight: 600;
+}
+.nanoclaw-tab-close {
+  opacity: 0.45;
+  padding: 0 2px;
+}
+.nanoclaw-tab-close:hover { opacity: 1; }
+.nanoclaw-newtab { font-weight: 700; }
+.nanoclaw-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /* Allow mouse text selection in the chat log (Obsidian view containers can
+     default to user-select:none). Children inherit this. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+.nanoclaw-msg { display: flex; flex-direction: column; gap: 2px; }
+.nanoclaw-role {
+  font-size: 11px;
+  text-transform: lowercase;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+.nanoclaw-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.nanoclaw-you .nanoclaw-body { background: var(--background-modifier-hover); }
+.nanoclaw-agent .nanoclaw-body { background: var(--background-secondary-alt); }
+.nanoclaw-input {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.nanoclaw-input textarea {
+  flex: 1 1 auto;
+  resize: vertical;
+  min-height: 48px;
+  font-family: var(--font-text);
+  font-size: var(--font-text-size);
+}
+.nanoclaw-input button { flex: 0 0 auto; align-self: flex-end; }
+.nanoclaw-input button.nanoclaw-stop {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+.nanoclaw-thinking { margin: 1px 0 2px; font-size: 0.9em; }
+.nanoclaw-thinking summary { cursor: pointer; color: var(--text-faint); }
+.nanoclaw-thinking-body {
+  white-space: pre-wrap;
+  color: var(--text-muted);
+  padding: 6px 10px;
+  margin-top: 4px;
+  border-left: 2px solid var(--background-modifier-border);
+}
