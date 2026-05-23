@@ -7,7 +7,7 @@
 // with replies routed back per-thread (no cross-talk). Plain JS, no deps,
 // desktop-only (needs Node's `net`).
 
-const { Plugin, ItemView, PluginSettingTab, Setting, FuzzySuggestModal, Notice } = require('obsidian');
+const { Plugin, ItemView, PluginSettingTab, Setting, FuzzySuggestModal, Modal, Notice } = require('obsidian');
 const net = require('net');
 const os = require('os');
 const path = require('path');
@@ -93,6 +93,8 @@ class NanoclawChatPlugin extends Plugin {
     this.addCommand({ id: 'nanoclaw-new-tab', name: 'New chat tab', callback: () => { this.newThread(); this.notify(); } });
     this.addCommand({ id: 'nanoclaw-open-chat', name: 'Open a saved chat', callback: () => this.promptOpenChat() });
     this.addCommand({ id: 'nanoclaw-toggle-model', name: 'Toggle DeepSeek model (fast ⇄ pro)', callback: () => { const isPro = (this.modelLabel || '').includes('pro'); this.setModel(isPro ? 'deepseek-v4-flash' : 'deepseek-v4-pro'); } });
+    this.addCommand({ id: 'nanoclaw-connect-mcp', name: 'Connect / manage MCP servers', callback: () => new McpManageModal(this.app, this).open() });
+    this.addCommand({ id: 'nanoclaw-list-mcp', name: 'List connected MCP servers', callback: () => this.listMcp() });
     this.modelLabel = this.currentModel();
     this.addSettingTab(new NanoclawSettingTab(this.app, this));
   }
@@ -263,6 +265,38 @@ class NanoclawChatPlugin extends Plugin {
   }
   stop(threadId) { const t = this.threads.get(threadId); if (t && t.inFlight) this.finalize(threadId, 'stopped'); }
 
+  // ── MCP control (connect/list/disconnect over the same socket) ────────────
+  // Reuses the in-flight turn machinery so the host's ack renders in the active
+  // tab exactly like an agent reply. `payload` is the control object (type + …);
+  // `label` is shown as the "you" bubble.
+  _runControl(payload, label) {
+    let threadId = this.activeId;
+    if (!threadId || !this.threads.has(threadId)) threadId = this.newThread();
+    const t = this.threads.get(threadId);
+    if (t.inFlight) { new Notice('This tab is busy — wait for the current turn to finish.'); return; }
+    if (t.messages.length === 0) t.title = label.slice(0, 24);
+    t.pendingUser = label;
+    t.messages.push({ role: 'you', text: label });
+    t.messages.push({ role: 'agent', text: '…', pending: true });
+    t.inFlight = true; t.started = false; t.acc = ''; t.t0 = Date.now();
+    t.ticker = setInterval(() => {
+      if (!t.started) { const last = t.messages[t.messages.length - 1]; if (last && last.pending) { last.text = `…working ${fmtElapsed(Date.now() - t.t0)}`; this.notify(); } }
+    }, 1000);
+    t.timer = setTimeout(() => this.finalize(threadId, `no reply within ${Math.round(this.settings.turnTimeoutMs / 60000)} min`), this.settings.turnTimeoutMs);
+    this.notify();
+    this.activateView();
+    try {
+      this.ensureSocket();
+      this.socket.write(JSON.stringify(Object.assign({ threadId }, payload)) + '\n');
+    } catch (e) { this.finalize(threadId, String((e && e.message) || e)); }
+  }
+  connectMcp(server, spec) {
+    const payload = spec ? { type: 'connect-mcp', spec } : { type: 'connect-mcp', server };
+    this._runControl(payload, `🔌 connect MCP: ${(spec && spec.name) || server}`);
+  }
+  listMcp() { this._runControl({ type: 'list-mcp' }, '🔌 list MCP servers'); }
+  disconnectMcp(server) { if (server) this._runControl({ type: 'disconnect-mcp', server }, `🔌 disconnect MCP: ${server}`); }
+
   async activateView() {
     const { workspace } = this.app;
     let leaf = workspace.getLeavesOfType(VIEW_TYPE)[0];
@@ -349,6 +383,9 @@ class NanoclawChatView extends ItemView {
     const mb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: isPro ? '💎 pro' : '⚡ fast' });
     mb.setAttr('title', `Model: deepseek/${mdl} — click to toggle fast (V4-Flash) / pro (V4-Pro); both thinking-on, global`);
     mb.onclick = () => this.plugin.setModel(isPro ? 'deepseek-v4-flash' : 'deepseek-v4-pro');
+    const mcpb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: '🔌 mcp' });
+    mcpb.setAttr('title', 'Connect / manage MCP servers for the agent');
+    mcpb.onclick = () => new McpManageModal(this.app, this.plugin).open();
 
     // Active conversation — keep the user's scroll position unless they're already
     // pinned near the bottom (sticky-bottom) or just switched threads, so streaming
@@ -416,6 +453,55 @@ class ChatPickerModal extends FuzzySuggestModal {
   getItems() { return this.files; }
   getItemText(f) { return f.basename; }
   onChooseItem(f) { this.onPick(f); }
+}
+
+// Connect / manage MCP servers. Presets are one-click; "custom" lets you wire any
+// MCP (command + args + env) — same trust as editing the DB yourself, since this
+// only travels over the owner-only local socket. The host acks into the chat tab.
+const MCP_PRESETS = [
+  ['wallstreetcn', '华尔街见闻 快讯/资讯 (in-tree shim, no key)'],
+  ['everything', 'MCP official test server (echo/add/printEnv…)'],
+  ['sequential-thinking', 'MCP official sequential-thinking'],
+  ['playwright', 'Playwright browser → container /usr/bin/chromium'],
+];
+
+class McpManageModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    const c = this.contentEl;
+    c.createEl('h3', { text: 'Connect / manage MCP servers' });
+    c.createEl('p', { cls: 'setting-item-description', text: 'Presets run inside the nanoclaw container. The result is acked into the active chat tab.' });
+
+    for (const [name, desc] of MCP_PRESETS) {
+      new Setting(c).setName(name).setDesc(desc)
+        .addButton((b) => b.setButtonText('Connect').setCta().onClick(() => { this.plugin.connectMcp(name); this.close(); }));
+    }
+
+    c.createEl('hr');
+    c.createEl('p', { cls: 'setting-item-description', text: 'Custom MCP (any command available in the container):' });
+    const custom = { name: '', command: '', args: '', env: '' };
+    new Setting(c).setName('Name').addText((t) => t.setPlaceholder('my-mcp').onChange((v) => (custom.name = v.trim())));
+    new Setting(c).setName('Command').addText((t) => t.setPlaceholder('npx').onChange((v) => (custom.command = v.trim())));
+    new Setting(c).setName('Args').setDesc('space-separated, e.g. -y some-mcp-package').addText((t) => t.setPlaceholder('-y some-mcp').onChange((v) => (custom.args = v)));
+    new Setting(c).setName('Env').setDesc('KEY=VALUE per line (optional)').addTextArea((t) => t.onChange((v) => (custom.env = v)));
+    new Setting(c).addButton((b) => b.setButtonText('Connect custom').setCta().onClick(() => {
+      if (!custom.name || !custom.command) { new Notice('name and command are required'); return; }
+      const args = custom.args.trim() ? custom.args.trim().split(/\s+/) : [];
+      const env = {};
+      for (const ln of custom.env.split('\n')) { const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(ln); if (m) env[m[1]] = m[2]; }
+      this.plugin.connectMcp(null, { name: custom.name, command: custom.command, args, env });
+      this.close();
+    }));
+
+    c.createEl('hr');
+    const manage = { name: '' };
+    new Setting(c).setName('List connected')
+      .addButton((b) => b.setButtonText('List').onClick(() => { this.plugin.listMcp(); this.close(); }));
+    new Setting(c).setName('Disconnect by name').setDesc('Removes it from the agent (next message respawns without it).')
+      .addText((t) => t.setPlaceholder('wallstreetcn').onChange((v) => (manage.name = v.trim())))
+      .addButton((b) => b.setButtonText('Disconnect').setWarning().onClick(() => { if (!manage.name) { new Notice('enter a name'); return; } this.plugin.disconnectMcp(manage.name); this.close(); }));
+  }
+  onClose() { this.contentEl.empty(); }
 }
 
 module.exports = NanoclawChatPlugin;
