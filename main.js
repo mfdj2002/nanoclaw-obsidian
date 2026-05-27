@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   // the socket until the final answer, so don't give up early — use Stop to interrupt.
   turnTimeoutMs: 1800000,
   modelScript: path.join(os.homedir(), 'cc', 'nanoclaw-model.sh'),
+  harvestFolder: 'Web Harvest',
 };
 
 function fmtElapsed(ms) { const s = Math.round(ms / 1000); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`; }
@@ -80,6 +81,7 @@ function parseChatMd(content, agentName) {
 class NanoclawChatPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    await this._autodetectInstall();
     this.threads = new Map();   // threadId -> { id, title, messages:[{role,text,pending}], inFlight, started, acc, t0, ticker, timer }
     this.activeId = null;
     this.views = new Set();
@@ -95,6 +97,7 @@ class NanoclawChatPlugin extends Plugin {
     this.addCommand({ id: 'nanoclaw-toggle-model', name: 'Toggle DeepSeek model (fast ⇄ pro)', callback: () => { const isPro = (this.modelLabel || '').includes('pro'); this.setModel(isPro ? 'deepseek-v4-flash' : 'deepseek-v4-pro'); } });
     this.addCommand({ id: 'nanoclaw-connect-mcp', name: 'Connect / manage MCP servers', callback: () => new McpManageModal(this.app, this).open() });
     this.addCommand({ id: 'nanoclaw-list-mcp', name: 'List connected MCP servers', callback: () => this.listMcp() });
+    this.addCommand({ id: 'nanoclaw-harvest-tabs', name: 'Harvest open browser tabs → Canvas', callback: () => this.harvestTabs() });
     this.modelLabel = this.currentModel();
     this.addSettingTab(new NanoclawSettingTab(this.app, this));
   }
@@ -181,7 +184,8 @@ class NanoclawChatPlugin extends Plugin {
       else if (!t.started) last.text = '(no reply)';
       else last.text = t.acc;
     }
-    this.saveTurn(t, t.pendingUser || '', (last && last.role === 'agent') ? last.text : '', (last && last.thinking) || '');
+    if (t.onDone) { const cb = t.onDone; t.onDone = null; try { cb((last && last.role === 'agent') ? last.text : ''); } catch (e) { /* noop */ } }
+    if (!t.noSave) this.saveTurn(t, t.pendingUser || '', (last && last.role === 'agent') ? last.text : '', (last && last.thinking) || '');
     this.notify();
   }
   failInFlight(msg) { for (const t of this.threads.values()) if (t.inFlight) this.finalize(t.id, msg); }
@@ -297,6 +301,130 @@ class NanoclawChatPlugin extends Plugin {
   listMcp() { this._runControl({ type: 'list-mcp' }, '🔌 list MCP servers'); }
   disconnectMcp(server) { if (server) this._runControl({ type: 'disconnect-mcp', server }, `🔌 disconnect MCP: ${server}`); }
 
+  // ── tab harvester: read open Surfing tabs → summarize via nanoclaw → Canvas ──
+  // All plugin-side: the harvester runs inside Obsidian's Electron so it reads
+  // Surfing's <webview> tabs directly. nanoclaw only does the summaries (over the
+  // existing socket). Output: one note per page + an Obsidian .canvas wired by the
+  // browsing (referrer) graph.
+  async harvestTabs() {
+    const tabs = await this._collectSurfingTabs();
+    if (!tabs.length) { new Notice('No open Surfing web tabs found — enable Surfing and open some pages first.'); return; }
+    new Notice(`Harvesting ${tabs.length} tab(s) — summarizing via nanoclaw…`);
+    let summaries = new Array(tabs.length).fill('');
+    try {
+      const reply = await this._agentRequest(this._harvestPrompt(tabs), `🗂 summarize ${tabs.length} harvested tab(s)`);
+      summaries = this._parseSummaries(reply, tabs.length);
+    } catch (e) { new Notice('summary step failed: ' + ((e && e.message) || e)); }
+    let canvasPath;
+    try {
+      canvasPath = await this._writeHarvest(tabs, summaries);
+      new Notice(`Harvest saved → ${canvasPath}`);
+      const f = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (f) this.app.workspace.getLeaf(true).openFile(f);
+    } catch (e) { new Notice('writing harvest failed: ' + ((e && e.message) || e)); return; }
+    // Summaries are saved, so closing the tabs is safe. Ask first.
+    if (window.confirm(`Close the ${tabs.length} harvested browser tab(s)?`)) {
+      for (const t of tabs) { try { t.leaf.detach(); } catch (e) { /* noop */ } }
+    }
+  }
+  async _collectSurfingTabs() {
+    const leaves = this.app.workspace.getLeavesOfType('surfing-view');
+    const out = [];
+    for (const leaf of leaves) {
+      const root = leaf.view && leaf.view.containerEl;
+      const wv = root && root.querySelector('webview');
+      if (!wv) continue;
+      let url = ''; try { url = wv.getURL ? wv.getURL() : (wv.getAttribute('src') || ''); } catch (e) { /* noop */ }
+      if (!url || url === 'about:blank' || url.startsWith('app://') || url.startsWith('obsidian://') || url.startsWith('chrome')) continue;
+      let title = ''; try { title = wv.getTitle ? wv.getTitle() : ''; } catch (e) { /* noop */ }
+      let referrer = '', text = '';
+      try { referrer = await wv.executeJavaScript('document.referrer'); } catch (e) { /* noop */ }
+      try { text = await wv.executeJavaScript('(document.body?document.body.innerText:"").replace(/\\s+/g," ").slice(0,2500)'); } catch (e) { /* noop */ }
+      out.push({ leaf, url, title: (title || url).slice(0, 120), referrer: referrer || '', text: text || '' });
+    }
+    return out;
+  }
+  _harvestPrompt(tabs) {
+    const blocks = tabs.map((t, i) => `[${i}] 标题: ${t.title}\nURL: ${t.url}\n正文(截断): ${t.text || '(无法读取正文)'}`).join('\n---\n');
+    return [
+      `你是网页摘要助手。以下是我浏览器里打开的 ${tabs.length} 个网页。`,
+      `请为每个网页写一个 2–3 句的中文摘要，抓住核心信息以及为什么值得保存。`,
+      `只输出一个严格的 JSON 数组，不要任何额外文字或解释，格式：`,
+      `[{"i":0,"summary":"…"},{"i":1,"summary":"…"}]`,
+      ``,
+      `网页：`,
+      blocks,
+    ].join('\n');
+  }
+  _parseSummaries(reply, n) {
+    const out = new Array(n).fill('');
+    if (!reply) return out;
+    const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(reply);
+    const body = fence ? fence[1] : reply;
+    const s = body.indexOf('['), e = body.lastIndexOf(']');
+    let arr = null;
+    if (s >= 0 && e > s) { try { arr = JSON.parse(body.slice(s, e + 1)); } catch (err) { /* noop */ } }
+    if (Array.isArray(arr)) for (const it of arr) { if (it && typeof it.i === 'number' && it.i >= 0 && it.i < n) out[it.i] = String(it.summary || '').trim(); }
+    return out;
+  }
+  async _writeHarvest(tabs, summaries) {
+    const stamp = new Date().toISOString().replace('T', ' ').slice(0, 16).replace(/:/g, '-');
+    const rootFolder = (this.settings.harvestFolder || 'Web Harvest').replace(/\/+$/, '');
+    const base = `${rootFolder}/${stamp}`;
+    const ensure = async (p) => { if (!this.app.vault.getAbstractFileByPath(p)) { try { await this.app.vault.createFolder(p); } catch (e) { /* exists/race */ } } };
+    await ensure(rootFolder); await ensure(base);
+    const slug = (x) => ((x || 'page').replace(/[\\/:*?"<>|#^[\]]+/g, ' ').replace(/\s+/g, ' ').trim() || 'page').slice(0, 48);
+    const notePaths = [];
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i], sum = summaries[i] || '(摘要不可用)';
+      const fp = `${base}/${String(i + 1).padStart(2, '0')} ${slug(t.title)}.md`;
+      const fm = `---\nurl: ${t.url}\ntitle: ${JSON.stringify(t.title)}\nreferrer: ${t.referrer || ''}\ncaptured: ${new Date().toISOString()}\nsource: nanoclaw-harvest\n---\n`;
+      const md = `${fm}\n# ${t.title}\n\n[${t.url}](${t.url})\n\n## 摘要\n\n${sum}\n`;
+      try { if (!this.app.vault.getAbstractFileByPath(fp)) await this.app.vault.create(fp, md); } catch (e) { /* noop */ }
+      notePaths.push(fp);
+    }
+    // Browsing graph: edges referrer → page (the page that linked here points to it).
+    const norm = (u) => (u || '').split('#')[0].replace(/\/+$/, '');
+    const byUrl = new Map(); tabs.forEach((t, i) => byUrl.set(norm(t.url), i));
+    const parent = tabs.map((t) => { const p = byUrl.get(norm(t.referrer)); return p === undefined ? -1 : p; });
+    parent.forEach((p, i) => { if (p === i) parent[i] = -1; });
+    const level = tabs.map((_, i) => { let d = 0, p = parent[i], g = 0; while (p >= 0 && g++ < tabs.length) { d++; p = parent[p]; } return d; });
+    const perLevel = {}, nodes = [], W = 420, H = 300, GX = 480, GY = 340;
+    for (let i = 0; i < tabs.length; i++) {
+      const L = level[i]; perLevel[L] = perLevel[L] || 0;
+      nodes.push({ id: `n${i}`, type: 'file', file: notePaths[i], x: L * GX, y: perLevel[L] * GY, width: W, height: H });
+      perLevel[L]++;
+    }
+    const edges = [];
+    for (let i = 0; i < tabs.length; i++) if (parent[i] >= 0) edges.push({ id: `e${i}`, fromNode: `n${parent[i]}`, toNode: `n${i}`, toEnd: 'arrow' });
+    const canvasPath = `${base}/graph.canvas`;
+    const json = JSON.stringify({ nodes, edges }, null, 2);
+    try { const ex = this.app.vault.getAbstractFileByPath(canvasPath); if (ex) await this.app.vault.modify(ex, json); else await this.app.vault.create(canvasPath, json); } catch (e) { /* noop */ }
+    return canvasPath;
+  }
+  // Send a one-off request to nanoclaw and resolve with the final reply text.
+  // Shows progress in a dedicated "🗂 harvest" tab; not saved to a chat note.
+  _agentRequest(wireText, label) {
+    return new Promise((resolve) => {
+      let id = this._harvestThreadId;
+      if (!id || !this.threads.has(id)) { id = this.newThread('🗂 harvest'); this._harvestThreadId = id; }
+      const t = this.threads.get(id);
+      if (t.inFlight) { new Notice('harvest tab is busy — try again in a moment'); resolve(''); return; }
+      t.noSave = true; t.title = '🗂 harvest';
+      this.activeId = id;
+      t.pendingUser = label;
+      t.messages.push({ role: 'you', text: label });
+      t.messages.push({ role: 'agent', text: '…', pending: true });
+      t.inFlight = true; t.started = false; t.acc = ''; t.t0 = Date.now();
+      t.onDone = (finalText) => resolve(finalText || '');
+      t.ticker = setInterval(() => { if (!t.started) { const last = t.messages[t.messages.length - 1]; if (last && last.pending) { last.text = `…summarizing ${fmtElapsed(Date.now() - t.t0)}`; this.notify(); } } }, 1000);
+      t.timer = setTimeout(() => this.finalize(id, `no reply within ${Math.round(this.settings.turnTimeoutMs / 60000)} min`), this.settings.turnTimeoutMs);
+      this.notify(); this.activateView();
+      try { this.ensureSocket(); this.socket.write(JSON.stringify({ threadId: id, text: wireText }) + '\n'); }
+      catch (e) { this.finalize(id, String((e && e.message) || e)); }
+    });
+  }
+
   async activateView() {
     const { workspace } = this.app;
     let leaf = workspace.getLeavesOfType(VIEW_TYPE)[0];
@@ -321,6 +449,36 @@ class NanoclawChatPlugin extends Plugin {
       else { this.modelLabel = this.currentModel(); new Notice('model → ' + this.modelLabel); }
       this.notify();
     });
+  }
+
+  // ── autodetect the nanoclaw install on first run ──────────────────────────
+  // The defaults (~/cc/nanoclaw-v2/...) don't match a checkout that lives anywhere
+  // else (the de-nested provision builds in place at the repo root). If both
+  // settings are still at their defaults AND the default paths don't exist, scan
+  // $HOME for any */deployment/scripts/nanoclaw-model.sh (a reliable install
+  // marker), then set socketPath/modelScript to that install. Pick the one with
+  // a live daemon (data/obsidian.sock present) if there are multiple. Never
+  // overrides a user-customized path.
+  async _autodetectInstall() {
+    const d = DEFAULT_SETTINGS;
+    const isDefault = this.settings.socketPath === d.socketPath && this.settings.modelScript === d.modelScript;
+    if (!isDefault) return;
+    if (fs.existsSync(d.socketPath) || fs.existsSync(d.modelScript)) return;
+    const home = os.homedir();
+    // Prune huge irrelevant trees so the find stays under ~2s.
+    const cmd = `find "${home}" -maxdepth 7 \\( -name Library -o -name node_modules -o -name .git -o -name .Trash -o -name .cache \\) -prune -o -path '*/deployment/scripts/nanoclaw-model.sh' -print 2>/dev/null`;
+    const out = await new Promise((res) => exec(cmd, { timeout: 15000 }, (_e, so) => res((so || '').split('\n').map((s) => s.trim()).filter(Boolean))));
+    if (!out.length) return;
+    const ranked = out.map((m) => {
+      const inst = path.resolve(m, '../../..');
+      const sock = path.join(inst, 'data', 'obsidian.sock');
+      return { inst, sock, model: m, hasSock: fs.existsSync(sock) };
+    }).sort((a, b) => (b.hasSock ? 1 : 0) - (a.hasSock ? 1 : 0));
+    const pick = ranked[0];
+    this.settings.socketPath = pick.sock;
+    this.settings.modelScript = pick.model;
+    await this.saveSettings();
+    new Notice(`nanoclaw: detected install at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running yet)'}`);
   }
 
   async saveSettings() { await this.saveData(this.settings); }
@@ -386,6 +544,9 @@ class NanoclawChatView extends ItemView {
     const mcpb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: '🔌 mcp' });
     mcpb.setAttr('title', 'Connect / manage MCP servers for the agent');
     mcpb.onclick = () => new McpManageModal(this.app, this.plugin).open();
+    const hb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: '🗂 harvest' });
+    hb.setAttr('title', 'Harvest open Surfing browser tabs → summaries + Canvas graph');
+    hb.onclick = () => this.plugin.harvestTabs();
 
     // Active conversation — keep the user's scroll position unless they're already
     // pinned near the bottom (sticky-bottom) or just switched threads, so streaming
@@ -440,6 +601,8 @@ class NanoclawSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(String(Math.round(this.plugin.settings.turnTimeoutMs / 60000))).onChange(async (v) => { this.plugin.settings.turnTimeoutMs = (parseInt(v, 10) || 30) * 60000; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Model switch script').setDesc('Path to nanoclaw-model.sh (powers the fast/pro toggle).')
       .addText((t) => t.setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('Harvest folder').setDesc('Vault folder for harvested web pages + Canvas graphs.')
+      .addText((t) => t.setValue(this.plugin.settings.harvestFolder).onChange(async (v) => { this.plugin.settings.harvestFolder = v.trim() || 'Web Harvest'; await this.plugin.saveSettings(); }));
   }
 }
 
