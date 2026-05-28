@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   // the socket until the final answer, so don't give up early — use Stop to interrupt.
   turnTimeoutMs: 1800000,
   modelScript: path.join(os.homedir(), 'cc', 'nanoclaw-model.sh'),
+  keyScript: path.join(os.homedir(), 'cc', 'nanoclaw-v2', 'deployment', 'scripts', 'nanoclaw-deepseek-key.sh'),
   harvestFolder: 'Web Harvest',
 };
 
@@ -98,6 +99,7 @@ class NanoclawChatPlugin extends Plugin {
     this.addCommand({ id: 'nanoclaw-connect-mcp', name: 'Connect / manage MCP servers', callback: () => new McpManageModal(this.app, this).open() });
     this.addCommand({ id: 'nanoclaw-list-mcp', name: 'List connected MCP servers', callback: () => this.listMcp() });
     this.addCommand({ id: 'nanoclaw-harvest-tabs', name: 'Harvest open browser tabs → Canvas', callback: () => this.harvestTabs() });
+    this.addCommand({ id: 'nanoclaw-rotate-key', name: 'Rotate DeepSeek API key', callback: () => new KeyRotateModal(this.app, this).open() });
     this.modelLabel = this.currentModel();
     this.addSettingTab(new NanoclawSettingTab(this.app, this));
   }
@@ -451,6 +453,21 @@ class NanoclawChatPlugin extends Plugin {
     });
   }
 
+  // Rotate the DeepSeek API key — shells out to nanoclaw-deepseek-key.sh, which
+  // delete-then-creates the api.deepseek.com secret in OneCLI. Running sessions
+  // pick it up on their next API call (OneCLI resolves secrets per request) —
+  // no container restart. Pass the key via env to keep it out of `ps`.
+  rotateKey(key) {
+    const script = expandHome(this.settings.keyScript);
+    if (!fs.existsSync(script)) { new Notice(`key script not found: ${script}`); return; }
+    if (!key || !/^sk-/.test(key)) { new Notice("key must look like 'sk-...'"); return; }
+    new Notice('rotating DeepSeek key…');
+    exec(`/bin/bash ${JSON.stringify(script)}`, { env: { ...process.env, DEEPSEEK_API_KEY: key } }, (err, _out, errout) => {
+      if (err) new Notice('key rotation failed: ' + ((errout && errout.trim()) || err.message));
+      else new Notice('✅ DeepSeek key rotated (next API call uses it)');
+    });
+  }
+
   // ── autodetect the nanoclaw install on first run ──────────────────────────
   // The defaults (~/cc/nanoclaw-v2/...) don't match a checkout that lives anywhere
   // else (the de-nested provision builds in place at the repo root). If both
@@ -477,6 +494,7 @@ class NanoclawChatPlugin extends Plugin {
     const pick = ranked[0];
     this.settings.socketPath = pick.sock;
     this.settings.modelScript = pick.model;
+    this.settings.keyScript = path.join(pick.inst, 'deployment', 'scripts', 'nanoclaw-deepseek-key.sh');
     await this.saveSettings();
     new Notice(`nanoclaw: detected install at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running yet)'}`);
   }
@@ -601,6 +619,8 @@ class NanoclawSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(String(Math.round(this.plugin.settings.turnTimeoutMs / 60000))).onChange(async (v) => { this.plugin.settings.turnTimeoutMs = (parseInt(v, 10) || 30) * 60000; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Model switch script').setDesc('Path to nanoclaw-model.sh (powers the fast/pro toggle).')
       .addText((t) => t.setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('Key rotate script').setDesc('Path to nanoclaw-deepseek-key.sh (powers the "Rotate DeepSeek API key" command).')
+      .addText((t) => t.setValue(this.plugin.settings.keyScript).onChange(async (v) => { this.plugin.settings.keyScript = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Harvest folder').setDesc('Vault folder for harvested web pages + Canvas graphs.')
       .addText((t) => t.setValue(this.plugin.settings.harvestFolder).onChange(async (v) => { this.plugin.settings.harvestFolder = v.trim() || 'Web Harvest'; await this.plugin.saveSettings(); }));
   }
@@ -663,6 +683,27 @@ class McpManageModal extends Modal {
     new Setting(c).setName('Disconnect by name').setDesc('Removes it from the agent (next message respawns without it).')
       .addText((t) => t.setPlaceholder('wallstreetcn').onChange((v) => (manage.name = v.trim())))
       .addButton((b) => b.setButtonText('Disconnect').setWarning().onClick(() => { if (!manage.name) { new Notice('enter a name'); return; } this.plugin.disconnectMcp(manage.name); this.close(); }));
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class KeyRotateModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    const c = this.contentEl;
+    c.createEl('h3', { text: 'Rotate DeepSeek API key' });
+    c.createEl('p', { cls: 'setting-item-description',
+      text: 'Replaces the key in OneCLI vault. Running sessions pick it up on the next API call — no restart needed.' });
+    let key = '';
+    new Setting(c).setName('New API key').setDesc('sk-…').addText((t) => {
+      t.setPlaceholder('sk-…').onChange((v) => { key = v.trim(); });
+      t.inputEl.type = 'password';
+    });
+    new Setting(c).addButton((b) => b.setButtonText('Rotate').setCta().onClick(() => {
+      if (!key) { new Notice('paste a key first'); return; }
+      this.plugin.rotateKey(key);
+      this.close();
+    }));
   }
   onClose() { this.contentEl.empty(); }
 }
