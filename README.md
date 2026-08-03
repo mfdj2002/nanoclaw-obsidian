@@ -124,7 +124,10 @@ are broadcast to all connected clients; each filters by the `threadId` it owns.
 `attachments` and `files` are optional; either side may send a message with files and empty
 text. Limits: 20 attachments per message, 32MB each, 48MB per wire line. An oversized line is
 skipped — framing resynchronizes at the next newline and you get a warning back, rather than
-the connection dropping mid-turn.
+the connection dropping mid-turn. Raise them in the daemon's `.env` if you routinely hand over
+large documents (`NANOCLAW_OBSIDIAN_MAX_ATTACHMENTS`, `NANOCLAW_OBSIDIAN_MAX_ATTACHMENT_MB`,
+`NANOCLAW_OBSIDIAN_MAX_LINE_MB`); keep the line limit above the attachment limit, since base64
+inflates by about a third.
 
 ## Validate the transport without Obsidian
 
