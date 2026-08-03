@@ -66,10 +66,31 @@
 .nanoclaw-input {
   flex: 0 0 auto;
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   padding: 10px 12px;
   border-top: 1px solid var(--background-modifier-border);
 }
+.nanoclaw-input-row { display: flex; gap: 8px; }
+.nanoclaw-tray { display: flex; flex-wrap: wrap; gap: 4px; }
+.nanoclaw-tray-empty { display: none; }
+.nanoclaw-files { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.nanoclaw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--background-modifier-hover);
+  font-size: 11px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nanoclaw-chip-x { cursor: pointer; opacity: 0.5; padding-left: 2px; }
+.nanoclaw-chip-x:hover { opacity: 1; }
+.nanoclaw-dragging { outline: 2px dashed var(--interactive-accent); outline-offset: -4px; }
 .nanoclaw-input textarea {
   flex: 1 1 auto;
   resize: vertical;

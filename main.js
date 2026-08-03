@@ -28,9 +28,35 @@ const DEFAULT_SETTINGS = {
   modelScript: path.join(os.homedir(), 'cc', 'nanoclaw-model.sh'),
   keyScript: path.join(os.homedir(), 'cc', 'nanoclaw-v2', 'deployment', 'scripts', 'nanoclaw-deepseek-key.sh'),
   harvestFolder: 'Web Harvest',
+  // Where files the agent sends back are written. The agent never learns this
+  // path — it calls send_file and the plugin decides where it lands — which is
+  // what keeps agent-authored documents findable regardless of what the
+  // container has mounted.
+  outputFolder: 'Andy Files',
+  // Models offered by the picker, as `vendor/model`. The vendor prefix is what
+  // lets nanoclaw route to a different API, so keep it — a bare name is
+  // interpreted as "the vendor already configured".
+  models: [
+    'deepseek/deepseek-v4-pro',
+    'deepseek/deepseek-v4-flash',
+    'deepseek/deepseek-chat',
+    'moonshotai/kimi-k3',
+  ],
 };
 
+// Guard against a stray drag-and-drop of something enormous; the whole file is
+// base64'd into one socket line, and the daemon caps its side at 32MB too.
+const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
 function fmtElapsed(ms) { const s = Math.round(ms / 1000); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`; }
+
+/** Filename → something safe to create in a vault. Strips path separators and
+ *  the characters Obsidian rejects, and refuses a leading dot. */
+function sanitizeFilename(name) {
+  const base = String(name || '').split(/[\\/]/).pop() || '';
+  const clean = base.replace(/[:*?"<>|#^[\]]+/g, '_').replace(/^\.+/, '').trim();
+  return clean || 'file';
+}
 
 function expandHome(p) {
   if (p === '~') return os.homedir();
@@ -95,7 +121,7 @@ class NanoclawChatPlugin extends Plugin {
     this.addCommand({ id: 'open-nanoclaw-chat', name: 'Open Nanoclaw chat', callback: () => this.activateView() });
     this.addCommand({ id: 'nanoclaw-new-tab', name: 'New chat tab', callback: () => { this.newThread(); this.notify(); } });
     this.addCommand({ id: 'nanoclaw-open-chat', name: 'Open a saved chat', callback: () => this.promptOpenChat() });
-    this.addCommand({ id: 'nanoclaw-toggle-model', name: 'Toggle DeepSeek model (fast ⇄ pro)', callback: () => { const isPro = (this.modelLabel || '').includes('pro'); this.setModel(isPro ? 'deepseek-v4-flash' : 'deepseek-v4-pro'); } });
+    this.addCommand({ id: 'nanoclaw-switch-model', name: 'Switch model / vendor', callback: () => new ModelPickerModal(this.app, this).open() });
     this.addCommand({ id: 'nanoclaw-connect-mcp', name: 'Connect / manage MCP servers', callback: () => new McpManageModal(this.app, this).open() });
     this.addCommand({ id: 'nanoclaw-list-mcp', name: 'List connected MCP servers', callback: () => this.listMcp() });
     this.addCommand({ id: 'nanoclaw-harvest-tabs', name: 'Harvest open browser tabs → Canvas', callback: () => this.harvestTabs() });
@@ -147,8 +173,69 @@ class NanoclawChatPlugin extends Plugin {
       this.rxbuf = this.rxbuf.slice(i + 1);
       if (!line) continue;
       let m; try { m = JSON.parse(line); } catch (e) { continue; }
-      if (typeof m.text === 'string') this.onReply(m.threadId || null, m.text, m.kind);
+      const hasFiles = Array.isArray(m.files) && m.files.length > 0;
+      // A send_file row can carry files with no covering text; don't render an
+      // empty bubble for it.
+      if (typeof m.text === 'string' && (m.text.length > 0 || !hasFiles)) this.onReply(m.threadId || null, m.text, m.kind);
+      if (hasFiles) void this.receiveAgentFiles(m.threadId || null, m.files);
     }
+  }
+
+  // ── files the agent sends back (send_file → vault) ────────────────────────
+  // The agent's filesystem is not the vault, so a path it mentions is useless to
+  // the user. Instead it hands over bytes and we write them into the vault and
+  // link them — the link is clickable, which is the whole point.
+  async receiveAgentFiles(threadId, files) {
+    let paths = [];
+    try { paths = await this.saveAgentFiles(files); } catch (e) { new Notice('nanoclaw: writing agent file failed: ' + ((e && e.message) || e)); return; }
+    if (!paths.length) return;
+    const line = paths.map((p) => `📄 [[${p}]]`).join('\n');
+    const t = this.threads.get(threadId);
+    if (!t) { new Notice(`${this.settings.agentName} saved ${paths.length} file(s) → ${paths[0]}`); return; }
+    // Vault writes are async, so the turn may already have finalized by the time
+    // we get here — in that case append a fresh message instead of losing it.
+    if (t.inFlight) this.onReply(threadId, line, 'final');
+    else { t.messages.push({ role: 'agent', text: line }); this.notify(); }
+  }
+
+  async saveAgentFiles(files) {
+    const folder = (this.settings.outputFolder || '').replace(/\/+$/, '');
+    if (folder) await this.ensureFolder(folder);
+    const out = [];
+    for (const f of files) {
+      const safe = sanitizeFilename(f && f.name);
+      const target = this.uniqueVaultPath(folder, safe);
+      const buf = Buffer.from(String((f && f.data) || ''), 'base64');
+      await this.app.vault.createBinary(target, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      out.push(target);
+    }
+    return out;
+  }
+
+  // Create every missing segment: `createFolder` does not make parents.
+  async ensureFolder(folder) {
+    const parts = folder.split('/').filter(Boolean);
+    let sofar = '';
+    for (const p of parts) {
+      sofar = sofar ? `${sofar}/${p}` : p;
+      if (!this.app.vault.getAbstractFileByPath(sofar)) {
+        try { await this.app.vault.createFolder(sofar); } catch (e) { /* exists / race */ }
+      }
+    }
+  }
+
+  // Never overwrite: a second "report.md" becomes "report-1.md".
+  uniqueVaultPath(folder, filename) {
+    const dir = folder ? folder + '/' : '';
+    if (!this.app.vault.getAbstractFileByPath(dir + filename)) return dir + filename;
+    const dot = filename.lastIndexOf('.');
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const ext = dot > 0 ? filename.slice(dot) : '';
+    for (let i = 1; i < 1000; i++) {
+      const cand = `${dir}${stem}-${i}${ext}`;
+      if (!this.app.vault.getAbstractFileByPath(cand)) return cand;
+    }
+    return `${dir}${stem}-${Date.now()}${ext}`;
   }
   onReply(threadId, text, kind) {
     const t = this.threads.get(threadId);
@@ -250,10 +337,15 @@ class NanoclawChatPlugin extends Plugin {
   sendMessage(threadId, raw) {
     const t = this.threads.get(threadId);
     const text = (raw || '').trim();
-    if (!t || t.inFlight || !text) return;
-    if (t.messages.length === 0) t.title = text.slice(0, 24) + (text.length > 24 ? '…' : '');
-    t.pendingUser = text;
-    t.messages.push({ role: 'you', text });
+    if (!t || t.inFlight) return;
+    const attachments = t.attach || [];
+    // "Have a look at this" with nothing typed is a legitimate message.
+    if (!text && !attachments.length) return;
+    if (t.messages.length === 0) t.title = (text || attachments[0].name).slice(0, 24) + ((text || attachments[0].name).length > 24 ? '…' : '');
+    // Note attachments in the persisted turn too, so the saved chat note doesn't
+    // read as a question about a document that appears out of nowhere.
+    t.pendingUser = text + (attachments.length ? `\n\n[attached: ${attachments.map((a) => a.name).join(', ')}]` : '');
+    t.messages.push({ role: 'you', text, files: attachments.map((a) => a.name) });
     t.messages.push({ role: 'agent', text: '…thinking', pending: true });
     t.inFlight = true; t.started = false; t.acc = ''; t.t0 = Date.now();
     t.ticker = setInterval(() => {
@@ -266,10 +358,66 @@ class NanoclawChatPlugin extends Plugin {
     this.notify();
     try {
       this.ensureSocket();
-      this.socket.write(JSON.stringify({ threadId, text }) + '\n');
+      const payload = { threadId, text };
+      if (attachments.length) payload.attachments = attachments.map((a) => ({ name: a.name, data: a.data, type: a.type }));
+      this.socket.write(JSON.stringify(payload) + '\n');
+      t.attach = [];
     } catch (e) { this.finalize(threadId, String((e && e.message) || e)); }
   }
   stop(threadId) { const t = this.threads.get(threadId); if (t && t.inFlight) this.finalize(threadId, 'stopped'); }
+
+  // ── attachments the user hands to the agent ───────────────────────────────
+  // Anything readable becomes base64 on the wire; the daemon writes it into the
+  // session inbox and tells the agent the path. Whether the agent can make sense
+  // of a given format is up to its tooling — see README.
+  attachTo(threadId, att) {
+    const t = this.threads.get(threadId);
+    if (!t) return;
+    if (!t.attach) t.attach = [];
+    t.attach.push(att);
+    this.notify();
+  }
+  dropAttachment(threadId, i) {
+    const t = this.threads.get(threadId);
+    if (!t || !t.attach) return;
+    t.attach.splice(i, 1);
+    this.notify();
+  }
+
+  /** Read an OS-level File (picker or drag-drop) into an attachment. */
+  async attachFromFile(threadId, file) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      new Notice(`${file.name} is too large (max ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB)`);
+      return;
+    }
+    const buf = Buffer.from(await file.arrayBuffer());
+    this.attachTo(threadId, { name: file.name, data: buf.toString('base64'), type: file.type || '' });
+  }
+
+  /** Read a file already inside the vault (internal drag, or a wikilink). */
+  async attachFromVault(threadId, tfile) {
+    const ab = await this.app.vault.readBinary(tfile);
+    if (ab.byteLength > MAX_ATTACHMENT_BYTES) {
+      new Notice(`${tfile.name} is too large (max ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB)`);
+      return;
+    }
+    this.attachTo(threadId, { name: tfile.name, data: Buffer.from(ab).toString('base64'), type: '' });
+  }
+
+  /**
+   * Obsidian's internal drags carry a wikilink or vault-relative path as text,
+   * not a File. Resolve it so dragging a note out of the file explorer works.
+   */
+  resolveVaultRef(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+    const link = /^!?\[\[([^\]|#]+)/.exec(s);
+    const ref = (link ? link[1] : s).trim();
+    const direct = this.app.vault.getAbstractFileByPath(ref);
+    if (direct && direct.extension) return direct;
+    const resolved = this.app.metadataCache.getFirstLinkpathDest(ref, '');
+    return resolved || null;
+  }
 
   // ── MCP control (connect/list/disconnect over the same socket) ────────────
   // Reuses the in-flight turn machinery so the host's ack renders in the active
@@ -435,20 +583,35 @@ class NanoclawChatPlugin extends Plugin {
   }
   // ── model choice (fast V4-Flash vs pro V4-Pro) — shells out to nanoclaw-model.sh ──
   modelEnvPath() { const sp = expandHome(this.settings.socketPath); return path.join(path.dirname(path.dirname(sp)), '.env'); }
+  // Keep the vendor prefix: with more than one vendor in play, "v4-pro" alone no
+  // longer says which API a turn will hit.
   currentModel() {
     try {
       const env = fs.readFileSync(this.modelEnvPath(), 'utf8');
-      const m = /^OPENCODE_MODEL=(?:deepseek\/)?(.+?)\s*$/m.exec(env);
+      const m = /^OPENCODE_MODEL=(.+?)\s*$/m.exec(env);
       return m ? m[1].trim() : '?';
     } catch (e) { return '?'; }
+  }
+  /** Short label for the tab strip — the model name without its vendor. */
+  modelShortLabel() {
+    const full = this.modelLabel || '?';
+    const i = full.indexOf('/');
+    return i > 0 ? full.slice(i + 1) : full;
   }
   setModel(model) {
     const script = expandHome(this.settings.modelScript);
     if (!fs.existsSync(script)) { new Notice(`model script not found: ${script}`); return; }
     new Notice(`switching model → ${model}…`);
-    exec(`/bin/bash ${JSON.stringify(script)} ${JSON.stringify(model)}`, (err, _out, errout) => {
-      if (err) new Notice('model switch failed: ' + ((errout && errout.trim()) || err.message));
-      else { this.modelLabel = this.currentModel(); new Notice('model → ' + this.modelLabel); }
+    exec(`/bin/bash ${JSON.stringify(script)} ${JSON.stringify(model)}`, (err, out, errout) => {
+      if (err) { new Notice('model switch failed: ' + ((errout && errout.trim()) || err.message)); this.notify(); return; }
+      // The script now stores the model per agent group, so .env no longer
+      // reflects it — trust what we just set rather than re-reading .env. A
+      // vendor-switch warning goes to stdout; surface it, since the switch will
+      // fail at the first API call if the key isn't in the vault.
+      this.modelLabel = model.includes('/') ? model : this.modelLabel.replace(/^([^/]+\/).*$/, `$1${model}`);
+      new Notice('model → ' + this.modelLabel);
+      const warn = String(out || '').split('\n').find((l) => l.includes('⚠'));
+      if (warn) new Notice(warn.trim(), 10000);
       this.notify();
     });
   }
@@ -518,8 +681,11 @@ class NanoclawChatView extends ItemView {
     this.tabsEl = root.createDiv({ cls: 'nanoclaw-tabs' });
     this.logEl = root.createDiv({ cls: 'nanoclaw-log' });
     const inp = root.createDiv({ cls: 'nanoclaw-input' });
-    this.textarea = inp.createEl('textarea', { attr: { rows: '3', placeholder: 'Message… (Enter to send · Shift+Enter newline)' } });
-    this.actionBtn = inp.createEl('button', { text: 'Send' });
+    this.trayEl = inp.createDiv({ cls: 'nanoclaw-tray' });
+    const row = inp.createDiv({ cls: 'nanoclaw-input-row' });
+    this.textarea = row.createEl('textarea', { attr: { rows: '3', placeholder: 'Message… (Enter to send · Shift+Enter newline · drop files to attach)' } });
+    const clip = row.createEl('button', { text: '📎', attr: { title: 'Attach files for the agent to read' } });
+    this.actionBtn = row.createEl('button', { text: 'Send' });
     this.actionBtn.onclick = () => {
       const t = this.plugin.threads.get(this.plugin.activeId);
       if (t && t.inFlight) this.plugin.stop(this.plugin.activeId); else this.doSend();
@@ -528,11 +694,42 @@ class NanoclawChatView extends ItemView {
       const t = this.plugin.threads.get(this.plugin.activeId);
       if (e.key === 'Enter' && !e.shiftKey && !(t && t.inFlight)) { e.preventDefault(); this.doSend(); }
     });
+
+    // Hidden native picker — the only way to reach files outside the vault,
+    // which is the common case for a PDF someone was just sent.
+    const picker = inp.createEl('input', { attr: { type: 'file', multiple: 'true' } });
+    picker.style.display = 'none';
+    picker.addEventListener('change', async () => {
+      for (const f of Array.from(picker.files || [])) await this.plugin.attachFromFile(this.plugin.activeId, f);
+      picker.value = '';
+    });
+    clip.onclick = () => picker.click();
+
+    // Drop anywhere over the panel. Obsidian's own drags hand over a wikilink
+    // rather than a File, so handle both.
+    const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+    root.addEventListener('dragover', (e) => { stop(e); root.addClass('nanoclaw-dragging'); });
+    root.addEventListener('dragleave', () => root.removeClass('nanoclaw-dragging'));
+    root.addEventListener('drop', async (e) => {
+      stop(e);
+      root.removeClass('nanoclaw-dragging');
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const osFiles = Array.from(dt.files || []);
+      if (osFiles.length) {
+        for (const f of osFiles) await this.plugin.attachFromFile(this.plugin.activeId, f);
+        return;
+      }
+      const ref = this.plugin.resolveVaultRef(dt.getData('text/plain'));
+      if (ref) await this.plugin.attachFromVault(this.plugin.activeId, ref);
+      else new Notice("Couldn't read that — try the 📎 button.");
+    });
   }
 
   doSend() {
     const v = this.textarea.value;
-    if (!v.trim()) return;
+    const t = this.plugin.threads.get(this.plugin.activeId);
+    if (!v.trim() && !(t && t.attach && t.attach.length)) return;
     this.textarea.value = '';
     this.plugin.sendMessage(this.plugin.activeId, v);
     this.textarea.focus();
@@ -555,10 +752,9 @@ class NanoclawChatView extends ItemView {
     open.setAttr('title', 'Open a saved chat');
     open.onclick = () => this.plugin.promptOpenChat();
     const mdl = this.plugin.modelLabel || '?';
-    const isPro = mdl.includes('pro');
-    const mb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: isPro ? '💎 pro' : '⚡ fast' });
-    mb.setAttr('title', `Model: deepseek/${mdl} — click to toggle fast (V4-Flash) / pro (V4-Pro); both thinking-on, global`);
-    mb.onclick = () => this.plugin.setModel(isPro ? 'deepseek-v4-flash' : 'deepseek-v4-pro');
+    const mb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: '🧠 ' + this.plugin.modelShortLabel() });
+    mb.setAttr('title', `Model: ${mdl} — click to switch. Edit the list in settings.`);
+    mb.onclick = () => new ModelPickerModal(this.app, this.plugin).open();
     const mcpb = this.tabsEl.createDiv({ cls: 'nanoclaw-tab nanoclaw-model', text: '🔌 mcp' });
     mcpb.setAttr('title', 'Connect / manage MCP servers for the agent');
     mcpb.onclick = () => new McpManageModal(this.app, this.plugin).open();
@@ -585,11 +781,25 @@ class NanoclawChatView extends ItemView {
           det.createEl('summary', { text: '🧠 thinking' });
           det.createDiv({ cls: 'nanoclaw-thinking-body', text: m.thinking });
         }
-        el.createDiv({ cls: 'nanoclaw-body', text: m.text });
+        if (m.text) el.createDiv({ cls: 'nanoclaw-body', text: m.text });
+        if (Array.isArray(m.files) && m.files.length) {
+          const fl = el.createDiv({ cls: 'nanoclaw-files' });
+          for (const name of m.files) fl.createSpan({ cls: 'nanoclaw-chip', text: '📎 ' + name });
+        }
       }
     }
     this.logEl.scrollTop = stick ? this.logEl.scrollHeight : prevScrollTop;
     this._renderedThreadId = this.plugin.activeId;
+
+    // Staged attachments for the active tab
+    this.trayEl.empty();
+    const staged = (t && t.attach) || [];
+    this.trayEl.toggleClass('nanoclaw-tray-empty', staged.length === 0);
+    staged.forEach((a, i) => {
+      const chip = this.trayEl.createSpan({ cls: 'nanoclaw-chip', text: '📎 ' + a.name + ' ' });
+      const x = chip.createSpan({ cls: 'nanoclaw-chip-x', text: '×' });
+      x.onclick = () => this.plugin.dropAttachment(this.plugin.activeId, i);
+    });
 
     // Button reflects active tab's state
     if (this.actionBtn) {
@@ -617,10 +827,17 @@ class NanoclawSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(this.plugin.settings.chatsFolder).onChange(async (v) => { this.plugin.settings.chatsFolder = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Turn timeout (minutes)').setDesc('Give up on a turn after this long with no reply (Stop interrupts sooner).')
       .addText((t) => t.setValue(String(Math.round(this.plugin.settings.turnTimeoutMs / 60000))).onChange(async (v) => { this.plugin.settings.turnTimeoutMs = (parseInt(v, 10) || 30) * 60000; await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName('Model switch script').setDesc('Path to nanoclaw-model.sh (powers the fast/pro toggle).')
+    new Setting(containerEl).setName('Models').setDesc('One `vendor/model` per line, offered by the model picker. Keep the vendor prefix — that is what selects which API is used. A new vendor also needs its API key in the OneCLI vault.')
+      .addTextArea((tx) => tx.setValue((this.plugin.settings.models || []).join('\n')).onChange(async (v) => {
+        this.plugin.settings.models = v.split('\n').map((s) => s.trim()).filter(Boolean);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName('Model switch script').setDesc('Path to nanoclaw-model.sh (powers the model picker).')
       .addText((t) => t.setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Key rotate script').setDesc('Path to nanoclaw-deepseek-key.sh (powers the "Rotate DeepSeek API key" command).')
       .addText((t) => t.setValue(this.plugin.settings.keyScript).onChange(async (v) => { this.plugin.settings.keyScript = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('Agent output folder').setDesc(`Vault folder where files ${this.plugin.settings.agentName} sends back are written (via send_file). Ask it to "send me the file" rather than to save to a path — its filesystem is not this vault.`)
+      .addText((tx) => tx.setValue(this.plugin.settings.outputFolder).onChange(async (v) => { this.plugin.settings.outputFolder = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Harvest folder').setDesc('Vault folder for harvested web pages + Canvas graphs.')
       .addText((t) => t.setValue(this.plugin.settings.harvestFolder).onChange(async (v) => { this.plugin.settings.harvestFolder = v.trim() || 'Web Harvest'; await this.plugin.saveSettings(); }));
   }
@@ -636,6 +853,26 @@ class ChatPickerModal extends FuzzySuggestModal {
   getItems() { return this.files; }
   getItemText(f) { return f.basename; }
   onChooseItem(f) { this.onPick(f); }
+}
+
+// Pick the model (and therefore the vendor) for the agent. The list is a setting
+// rather than hardcoded because vendors ship new model ids constantly; anything
+// typed in is passed straight through, so a brand-new model works the day it
+// lands without a plugin update.
+class ModelPickerModal extends FuzzySuggestModal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.setPlaceholder(`Switch model — current: ${plugin.modelLabel || '?'}`);
+  }
+  getItems() {
+    const list = (this.plugin.settings.models || []).slice();
+    const cur = this.plugin.modelLabel;
+    if (cur && cur !== '?' && !list.includes(cur)) list.unshift(cur);
+    return list;
+  }
+  getItemText(m) { return m === this.plugin.modelLabel ? `${m}  ✓ current` : m; }
+  onChooseItem(m) { this.plugin.setModel(m); }
 }
 
 // Connect / manage MCP servers. Presets are one-click; "custom" lets you wire any
