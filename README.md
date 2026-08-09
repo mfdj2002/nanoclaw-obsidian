@@ -59,8 +59,13 @@ command palette → "Open Nanoclaw chat".
 
 ### Giving the agent documents
 
-Attachments land in the agent's session inbox and it's told the path, so "summarize this"
-works. Whether it can *parse* a given format depends on its container tooling and model:
+With a **Shared folder** configured, attaching does the least surprising thing: a file already
+in that folder is handed over by path (no copy — you both edit the same file), and a file from
+outside is copied into `<shared>/attachments/<thread>/`, where you can see it and delete it
+whenever you like. Without one, files are sent into the agent's private session inbox instead,
+which works but is invisible to you and expires on the retention schedule.
+
+Either way the agent is told the exact path, so "summarize this" works. Whether it can *parse* a given format depends on its container tooling and model:
 
 | Format | Works |
 |---|---|
@@ -82,6 +87,11 @@ split. Ask for a chunked pass rather than expecting one shot.
   healthy daemon as unreachable.
 - **Agent name** — label on replies.
 - **Chats folder** — where conversation `.md` notes are saved.
+- **Shared folder** — a vault folder that is *also* mounted into the agent (set up by
+  `nanoclaw-mount-vault.sh`, which gives it the same name on both sides). When set, attaching
+  a file puts it here rather than in the agent's private session inbox, and a file already in
+  here is handed over **by path, not by copy** — so the agent edits the same bytes you see.
+  Blank falls back to the inbox.
 - **Agent output folder** — where files the agent sends back are written. Put it inside the
   folder mounted into the agent (e.g. `workspace/Andy Files`) so it can re-read and revise its
   own output; anywhere else in the vault is write-only from its side.

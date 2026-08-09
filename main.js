@@ -38,6 +38,13 @@ const DEFAULT_SETTINGS = {
   // what keeps agent-authored documents findable regardless of what the
   // container has mounted.
   outputFolder: 'Andy Files',
+  // Vault-relative folder that is ALSO mounted into the agent (set up by
+  // nanoclaw-mount-vault.sh, which gives it the same name on both sides). When
+  // set, attachments go here instead of being base64'd into the agent's private
+  // session inbox: one copy, visible to you, editable by both, and yours to
+  // delete. Blank falls back to the inbox — which is what the first minutes of
+  // an install look like, before the mount exists.
+  sharedFolder: '',
   // Models offered by the picker, as `vendor/model`. The vendor prefix is what
   // lets nanoclaw route to a different API, so keep it — a bare name is
   // interpreted as "the vendor already configured".
@@ -377,14 +384,19 @@ class NanoclawChatPlugin extends Plugin {
     const t = this.threads.get(threadId);
     const text = (raw || '').trim();
     if (!t || t.inFlight) return;
-    const attachments = t.attach || [];
+    const staged = t.attach || [];
+    // Files living in the shared folder travel as a PATH the agent opens; only
+    // the fallback (no shared folder) ships bytes through the session inbox.
+    const shared = staged.filter((a) => a.shared);
+    const attachments = staged.filter((a) => !a.shared);
     // "Have a look at this" with nothing typed is a legitimate message.
-    if (!text && !attachments.length) return;
-    if (t.messages.length === 0) t.title = (text || attachments[0].name).slice(0, 24) + ((text || attachments[0].name).length > 24 ? '…' : '');
+    if (!text && !staged.length) return;
+    const label = text || staged[0].name;
+    if (t.messages.length === 0) t.title = label.slice(0, 24) + (label.length > 24 ? '…' : '');
     // Note attachments in the persisted turn too, so the saved chat note doesn't
     // read as a question about a document that appears out of nowhere.
-    t.pendingUser = text + (attachments.length ? `\n\n[attached: ${attachments.map((a) => a.name).join(', ')}]` : '');
-    t.messages.push({ role: 'you', text, files: attachments.map((a) => a.name) });
+    t.pendingUser = text + (staged.length ? `\n\n[attached: ${staged.map((a) => a.name).join(', ')}]` : '');
+    t.messages.push({ role: 'you', text, files: staged.map((a) => a.name) });
     t.messages.push({ role: 'agent', text: '…thinking', pending: true });
     t.inFlight = true; t.started = false; t.acc = ''; t.t0 = Date.now();
     t.ticker = setInterval(() => {
@@ -397,13 +409,32 @@ class NanoclawChatPlugin extends Plugin {
     this.notify();
     try {
       this.ensureSocket();
-      const payload = { threadId, text };
+      // Mirror the wording the agent already sees for inbox attachments, so a
+      // shared-folder file reads the same way in the prompt — name plus the exact
+      // path to open. Nothing on the wire changes; this is just message text.
+      const refs = shared.map((a) => `[file: ${a.name} — open it at ${a.containerPath}]`).join('\n');
+      const payload = { threadId, text: refs ? (text ? text + '\n\n' + refs : refs) : text };
       if (attachments.length) payload.attachments = attachments.map((a) => ({ name: a.name, data: a.data, type: a.type }));
       this.socket.write(JSON.stringify(payload) + '\n');
       t.attach = [];
     } catch (e) { this.finalize(threadId, String((e && e.message) || e)); }
   }
   stop(threadId) { const t = this.threads.get(threadId); if (t && t.inFlight) this.finalize(threadId, 'stopped'); }
+
+  /** Container path of the shared folder. mount-vault.sh mounts <vault>/<name>
+   *  at /workspace/extra/<name>, same leaf both sides, so this is derivable. */
+  sharedContainerRoot() {
+    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    return f ? '/workspace/extra/' + f.split('/').pop() : null;
+  }
+  /** Vault path → the path the agent opens, or null if outside the shared folder. */
+  containerPathFor(vaultPath) {
+    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    const root = this.sharedContainerRoot();
+    if (!f || !root) return null;
+    if (vaultPath !== f && !vaultPath.startsWith(f + '/')) return null;
+    return root + vaultPath.slice(f.length);
+  }
 
   // ── attachments the user hands to the agent ───────────────────────────────
   // Anything readable becomes base64 on the wire; the daemon writes it into the
@@ -430,17 +461,49 @@ class NanoclawChatPlugin extends Plugin {
       return;
     }
     const buf = Buffer.from(await file.arrayBuffer());
+    if (await this._stageInShared(threadId, file.name, buf)) return;
     this.attachTo(threadId, { name: file.name, data: buf.toString('base64'), type: file.type || '' });
   }
 
   /** Read a file already inside the vault (internal drag, or a wikilink). */
   async attachFromVault(threadId, tfile) {
+    // Already inside the shared folder → hand over the PATH, not the bytes. No
+    // copy at all, so edits flow both ways and there is nothing to diverge.
+    const inPlace = this.containerPathFor(tfile.path);
+    if (inPlace) {
+      this.attachTo(threadId, { name: tfile.name, shared: true, vaultPath: tfile.path, containerPath: inPlace });
+      return;
+    }
     const ab = await this.app.vault.readBinary(tfile);
     if (ab.byteLength > MAX_ATTACHMENT_BYTES) {
       new Notice(`${tfile.name} is too large (max ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB)`);
       return;
     }
+    if (await this._stageInShared(threadId, tfile.name, Buffer.from(ab))) return;
     this.attachTo(threadId, { name: tfile.name, data: Buffer.from(ab).toString('base64'), type: '' });
+  }
+
+  /**
+   * Copy bytes into <shared>/attachments/<thread>/ and attach a reference.
+   * Returns false when no shared folder is configured, so callers fall back to
+   * the base64/inbox path.
+   */
+  async _stageInShared(threadId, name, buf) {
+    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    if (!f) return false;
+    const dir = `${f}/attachments/${threadId}`;
+    try {
+      await this.ensureFolder(dir);
+      const target = this.uniqueVaultPath(dir, sanitizeFilename(name));
+      await this.app.vault.createBinary(target, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      const cp = this.containerPathFor(target);
+      if (!cp) return false;
+      this.attachTo(threadId, { name, shared: true, vaultPath: target, containerPath: cp });
+      return true;
+    } catch (e) {
+      new Notice(`couldn't stage ${name} in ${f}: ${(e && e.message) || e}`);
+      return false;
+    }
   }
 
   /**
@@ -887,7 +950,8 @@ class NanoclawChatView extends ItemView {
     const staged = (t && t.attach) || [];
     this.trayEl.toggleClass('nanoclaw-tray-empty', staged.length === 0);
     staged.forEach((a, i) => {
-      const chip = this.trayEl.createSpan({ cls: 'nanoclaw-chip', text: '📎 ' + a.name + ' ' });
+      const chip = this.trayEl.createSpan({ cls: 'nanoclaw-chip', text: (a.shared ? '🔗 ' : '📎 ') + a.name + ' ' });
+      if (a.shared) chip.setAttr('title', `shared live at ${a.vaultPath} — the agent edits this file, not a copy`);
       const x = chip.createSpan({ cls: 'nanoclaw-chip-x', text: '×' });
       x.onclick = () => this.plugin.dropAttachment(this.plugin.activeId, i);
     });
@@ -942,6 +1006,12 @@ class NanoclawSettingTab extends PluginSettingTab {
       .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Key rotate script').setDesc('Path to nanoclaw-deepseek-key.sh (powers the "Rotate DeepSeek API key" command).')
       .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.keyScript).onChange(async (v) => { this.plugin.settings.keyScript = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('Shared folder')
+      .setDesc('Vault folder that is also mounted into the agent (set up by nanoclaw-mount-vault.sh). When set, attached files land here instead of the agent\'s private inbox — one copy, visible to you, editable by both. Leave blank to use the inbox.')
+      .addText((tx) => tx.setPlaceholder('shared-with-agent').setValue(this.plugin.settings.sharedFolder).onChange(async (v) => {
+        this.plugin.settings.sharedFolder = v.trim().replace(/^\/+|\/+$/g, '');
+        await this.plugin.saveSettings();
+      }));
     new Setting(containerEl).setName('Agent output folder').setDesc(`Vault folder where files ${this.plugin.settings.agentName} sends back are written (via send_file). Put it INSIDE the folder mounted into the agent (e.g. "workspace/${this.plugin.settings.agentName} Files") if you want it to be able to re-read and revise its own output — anywhere else in the vault is write-only from its side.`)
       .addText((tx) => tx.setValue(this.plugin.settings.outputFolder).onChange(async (v) => { this.plugin.settings.outputFolder = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Attachment retention (days)')
