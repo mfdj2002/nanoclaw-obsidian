@@ -147,6 +147,18 @@ large documents (`NANOCLAW_OBSIDIAN_MAX_ATTACHMENTS`, `NANOCLAW_OBSIDIAN_MAX_ATT
 `NANOCLAW_OBSIDIAN_MAX_LINE_MB`); keep the line limit above the attachment limit, since base64
 inflates by about a third.
 
+## Tests
+
+```bash
+node --test test/
+```
+
+Zero-dependency: `test/stub-obsidian.js` stands in for Obsidian's module with an in-memory
+vault, so the real routing logic runs outside the app. Covers where an attached file goes
+(shared folder by path vs copied in vs base64 fallback), what reaches the wire, and the
+output-folder write rules. Obsidian's own plumbing — drag payloads, the native picker,
+rendering — is not covered and still needs a manual pass.
+
 ## Validate the transport without Obsidian
 
 ```bash
