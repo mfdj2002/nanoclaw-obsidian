@@ -231,8 +231,20 @@ class NanoclawChatPlugin extends Plugin {
     const out = [];
     for (const f of files) {
       const safe = sanitizeFilename(f && f.name);
-      const target = this.uniqueVaultPath(folder, safe);
       const buf = Buffer.from(String((f && f.data) || ''), 'base64');
+      // If the agent wrote the file into the shared folder AND sent it, the
+      // bytes already at the target are the same bytes — suffixing would leave
+      // a spurious `report-1.md` beside the real one. Identical content is a
+      // no-op; only genuinely different content earns a new name.
+      const direct = (folder ? folder + '/' : '') + safe;
+      const existing = this.app.vault.getAbstractFileByPath(direct);
+      if (existing) {
+        try {
+          const cur = Buffer.from(await this.app.vault.readBinary(existing));
+          if (cur.equals(buf)) { out.push(direct); continue; }
+        } catch (e) { /* unreadable — fall through and write a new name */ }
+      }
+      const target = this.uniqueVaultPath(folder, safe);
       await this.app.vault.createBinary(target, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
       out.push(target);
     }
