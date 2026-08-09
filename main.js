@@ -135,7 +135,14 @@ class NanoclawChatPlugin extends Plugin {
     this.addSettingTab(new NanoclawSettingTab(this.app, this));
   }
 
-  onunload() { if (this.socket) { try { this.socket.destroy(); } catch (e) { /* noop */ } } }
+  onunload() { this.resetSocket(); }
+
+  /** Drop the current connection; the next send reconnects using current settings. */
+  resetSocket() {
+    if (this.socket) { try { this.socket.destroy(); } catch (e) { /* noop */ } }
+    this.socket = null;
+    this.rxbuf = '';
+  }
 
   // ── threads (tabs) ────────────────────────────────────────────────────────
   newThread(title) {
@@ -895,7 +902,15 @@ class NanoclawSettingTab extends PluginSettingTab {
         finally { b.setDisabled(false).setButtonText('Detect'); }
       }));
     new Setting(containerEl).setName('Socket path').setDesc('nanoclaw obsidian.sock (multi-session channel). Auto-repaired when unreachable.')
-      .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.socketPath).onChange(async (v) => { this.plugin.settings.socketPath = v.trim(); await this.plugin.saveSettings(); }));
+      .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.socketPath).onChange(async (v) => {
+        this.plugin.settings.socketPath = v.trim();
+        await this.plugin.saveSettings();
+        // Drop any live connection so the next message dials the new path.
+        // Without this the change appears to do nothing until the old socket
+        // happens to close, which reads as "I fixed the setting and it's still
+        // broken" — the exact confusion this field exists to resolve.
+        this.plugin.resetSocket();
+      }));
     new Setting(containerEl).setName('Agent name').setDesc('Label shown on agent replies.')
       .addText((t) => t.setValue(this.plugin.settings.agentName).onChange(async (v) => { this.plugin.settings.agentName = v.trim() || 'andy'; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Silence timeout (ms)').setDesc('Finalize a reply after this much quiet following the first line.')
