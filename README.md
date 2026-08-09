@@ -73,7 +73,10 @@ split. Ask for a chunked pass rather than expecting one shot.
 
 ## Settings
 
-- **Socket path** — defaults to `~/cc/nanoclaw-v2/data/obsidian.sock`.
+- **Find my install** — scans your home folder for a nanoclaw install and points the paths
+  at it. The defaults are only a guess: an install directory can be named anything, so the
+  plugin also re-scans automatically whenever the socket turns out to be unreachable.
+- **Socket path** — `<install>/data/obsidian.sock`. Auto-repaired when unreachable.
 - **Agent name** — label on replies.
 - **Chats folder** — where conversation `.md` notes are saved.
 - **Agent output folder** — where files the agent sends back are written. Put it inside the

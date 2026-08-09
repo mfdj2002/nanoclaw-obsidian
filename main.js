@@ -157,10 +157,19 @@ class NanoclawChatPlugin extends Plugin {
     const s = net.connect(sp);
     this.socket = s;
     s.on('error', (e) => {
-      const msg = (e && (e.code === 'ENOENT' || e.code === 'ECONNREFUSED'))
-        ? `daemon not reachable at ${sp} — is the nanoclaw service running?`
+      const unreachable = e && (e.code === 'ENOENT' || e.code === 'ECONNREFUSED');
+      const msg = unreachable
+        ? `daemon not reachable at ${sp} — is the nanoclaw service running? (checking for a moved install…)`
         : String((e && e.message) || e);
       this.failInFlight(msg);
+      // The path is as likely to be wrong as the daemon is to be down — the
+      // default guesses an install directory name. Re-scan rather than leaving
+      // the user staring at a path that will never exist. Throttled so a flapping
+      // daemon doesn't trigger a filesystem scan per reconnect.
+      if (unreachable && Date.now() - (this._lastDetect || 0) > 60000) {
+        this._lastDetect = Date.now();
+        this._autodetectInstall().catch(() => {});
+      }
     });
     s.on('close', () => { if (this.socket === s) this.socket = null; });
     s.on('data', (c) => this.onData(c));
@@ -649,35 +658,54 @@ class NanoclawChatPlugin extends Plugin {
     });
   }
 
-  // ── autodetect the nanoclaw install on first run ──────────────────────────
-  // The defaults (~/cc/nanoclaw-v2/...) don't match a checkout that lives anywhere
-  // else (the de-nested provision builds in place at the repo root). If both
-  // settings are still at their defaults AND the default paths don't exist, scan
-  // $HOME for any */deployment/scripts/nanoclaw-model.sh (a reliable install
-  // marker), then set socketPath/modelScript to that install. Pick the one with
-  // a live daemon (data/obsidian.sock present) if there are multiple. Never
-  // overrides a user-customized path.
-  async _autodetectInstall() {
-    const d = DEFAULT_SETTINGS;
-    const isDefault = this.settings.socketPath === d.socketPath && this.settings.modelScript === d.modelScript;
-    if (!isDefault) return;
-    if (fs.existsSync(d.socketPath) || fs.existsSync(d.modelScript)) return;
+  // ── locate the nanoclaw install ───────────────────────────────────────────
+  // The defaults are a guess: an install directory can be named anything, and
+  // `nanoclaw-v2` is just one person's choice. Rather than trusting the guess,
+  // scan $HOME for */deployment/scripts/nanoclaw-model.sh (a reliable install
+  // marker) and adopt the install that actually has a live daemon socket.
+  //
+  // The guard is "the configured socket does not exist", not "settings are
+  // untouched" — that also repairs a customised path after the install moves or
+  // is renamed, and it can never clobber a working config, because a working
+  // config means the socket is there.
+  //
+  // Auto-adoption additionally requires the candidate to have a LIVE socket, so
+  // a stopped daemon on install A never silently repoints the plugin at
+  // install B. `force` (the settings button) reports whatever it finds.
+  async _autodetectInstall({ force = false } = {}) {
+    const configured = expandHome(this.settings.socketPath || '');
+    if (!force && configured && fs.existsSync(configured)) return false;
+
     const home = os.homedir();
     // Prune huge irrelevant trees so the find stays under ~2s.
     const cmd = `find "${home}" -maxdepth 7 \\( -name Library -o -name node_modules -o -name .git -o -name .Trash -o -name .cache \\) -prune -o -path '*/deployment/scripts/nanoclaw-model.sh' -print 2>/dev/null`;
-    const out = await new Promise((res) => exec(cmd, { timeout: 15000 }, (_e, so) => res((so || '').split('\n').map((s) => s.trim()).filter(Boolean))));
-    if (!out.length) return;
+    const out = await new Promise((res) => exec(cmd, { timeout: 15000 }, (_e, so) => res((so || '').split('\n').map((x) => x.trim()).filter(Boolean))));
+    if (!out.length) {
+      if (force) new Notice('nanoclaw: no install found under your home folder — set the socket path manually.');
+      return false;
+    }
+
     const ranked = out.map((m) => {
       const inst = path.resolve(m, '../../..');
       const sock = path.join(inst, 'data', 'obsidian.sock');
       return { inst, sock, model: m, hasSock: fs.existsSync(sock) };
     }).sort((a, b) => (b.hasSock ? 1 : 0) - (a.hasSock ? 1 : 0));
+
     const pick = ranked[0];
+    if (!pick.hasSock && !force) return false;   // don't repoint on a guess
+    if (pick.sock === configured) {
+      if (force) new Notice(`nanoclaw: already pointed at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running)'}`);
+      return false;
+    }
+
     this.settings.socketPath = pick.sock;
     this.settings.modelScript = pick.model;
     this.settings.keyScript = path.join(pick.inst, 'deployment', 'scripts', 'nanoclaw-deepseek-key.sh');
     await this.saveSettings();
-    new Notice(`nanoclaw: detected install at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running yet)'}`);
+    this.modelLabel = this.currentModel();
+    new Notice(`nanoclaw: found install at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running yet)'}`);
+    this.notify();
+    return true;
   }
 
   async saveSettings() { await this.saveData(this.settings); }
@@ -833,7 +861,14 @@ class NanoclawSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName('Socket path').setDesc('nanoclaw obsidian.sock (multi-session channel).')
+    new Setting(containerEl).setName('Find my install')
+      .setDesc('Scan your home folder for a nanoclaw install and point the paths below at it. The defaults are only a guess — an install directory can be named anything.')
+      .addButton((b) => b.setButtonText('Detect').onClick(async () => {
+        b.setDisabled(true).setButtonText('Scanning…');
+        try { await this.plugin._autodetectInstall({ force: true }); this.display(); }
+        finally { b.setDisabled(false).setButtonText('Detect'); }
+      }));
+    new Setting(containerEl).setName('Socket path').setDesc('nanoclaw obsidian.sock (multi-session channel). Auto-repaired when unreachable.')
       .addText((t) => t.setValue(this.plugin.settings.socketPath).onChange(async (v) => { this.plugin.settings.socketPath = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Agent name').setDesc('Label shown on agent replies.')
       .addText((t) => t.setValue(this.plugin.settings.agentName).onChange(async (v) => { this.plugin.settings.agentName = v.trim() || 'andy'; await this.plugin.saveSettings(); }));
