@@ -76,7 +76,12 @@ split. Ask for a chunked pass rather than expecting one shot.
 - **Socket path** — defaults to `~/cc/nanoclaw-v2/data/obsidian.sock`.
 - **Agent name** — label on replies.
 - **Chats folder** — where conversation `.md` notes are saved.
-- **Agent output folder** — where files the agent sends back are written.
+- **Agent output folder** — where files the agent sends back are written. Put it inside the
+  folder mounted into the agent (e.g. `workspace/Andy Files`) so it can re-read and revise its
+  own output; anywhere else in the vault is write-only from its side.
+- **Attachment retention (days)** — how long nanoclaw keeps its copies of attached/sent files
+  in session storage. `0` disables cleanup. Lives in the daemon's `.env`
+  (`INBOX_RETENTION_DAYS`), not plugin data, and applies within the hour without a restart.
 - **Models** — one `vendor/model` per line, offered by the picker.
 - **Silence / turn timeouts** — when to finalize after the last reply line / give up on a stalled turn.
 - **Model switch script** — path to `nanoclaw-model.sh` (powers the model picker).
