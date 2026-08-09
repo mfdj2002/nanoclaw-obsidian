@@ -690,29 +690,6 @@ class NanoclawChatPlugin extends Plugin {
     const sp = expandHome(this.settings.socketPath || '');
     return sp ? path.join(path.dirname(path.dirname(sp)), '.env') : null;
   }
-  // nanoclaw's .env is the single source of truth for daemon-side settings, so
-  // read and write it in place rather than mirroring the value into plugin data
-  // where the two could drift apart.
-  readEnvVar(key, fallback) {
-    try {
-      const envPath = this.modelEnvPath();
-      if (!envPath) return fallback;
-      const m = new RegExp('^' + key + '=(.*)$', 'm').exec(fs.readFileSync(envPath, 'utf8'));
-      return m ? m[1].trim() : fallback;
-    } catch (e) { return fallback; }
-  }
-  writeEnvVar(key, value) {
-    const p = this.modelEnvPath();
-    if (!p) { new Notice('nanoclaw install not located — run Find my install first'); return false; }
-    let env;
-    try { env = fs.readFileSync(p, 'utf8'); } catch (e) { new Notice(`can't read ${p}`); return false; }
-    const line = `${key}=${value}`;
-    const re = new RegExp('^' + key + '=.*$', 'm');
-    env = re.test(env) ? env.replace(re, line) : env.replace(/\n*$/, '\n') + line + '\n';
-    try { fs.writeFileSync(p, env); return true; } catch (e) { new Notice(`can't write ${p}: ${e.message}`); return false; }
-  }
-  // Keep the vendor prefix: with more than one vendor in play, "v4-pro" alone no
-  // longer says which API a turn will hit.
   currentModel() {
     try {
       const envPath = this.modelEnvPath();
@@ -1014,13 +991,6 @@ class NanoclawSettingTab extends PluginSettingTab {
       }));
     new Setting(containerEl).setName('Agent output folder').setDesc(`Vault folder where files ${this.plugin.settings.agentName} sends back are written (via send_file). Put it INSIDE the folder mounted into the agent (e.g. "workspace/${this.plugin.settings.agentName} Files") if you want it to be able to re-read and revise its own output — anywhere else in the vault is write-only from its side.`)
       .addText((tx) => tx.setValue(this.plugin.settings.outputFolder).onChange(async (v) => { this.plugin.settings.outputFolder = v.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName('Attachment retention (days)')
-      .setDesc('How long nanoclaw keeps copies of files you attach (and files the agent sends back) in its session storage. 0 disables cleanup. Applies within the hour — no restart needed. Stored in the daemon\'s .env, not here.')
-      .addText((tx) => tx.setValue(this.plugin.readEnvVar('INBOX_RETENTION_DAYS', '30')).onChange((v) => {
-        const t = v.trim();
-        if (t === '' || !/^\d+$/.test(t)) return;   // ignore mid-typing garbage; only commit valid values
-        this.plugin.writeEnvVar('INBOX_RETENTION_DAYS', t);
-      }));
     new Setting(containerEl).setName('Harvest folder').setDesc('Vault folder for harvested web pages + Canvas graphs.')
       .addText((t) => t.setValue(this.plugin.settings.harvestFolder).onChange(async (v) => { this.plugin.settings.harvestFolder = v.trim() || 'Web Harvest'; await this.plugin.saveSettings(); }));
   }

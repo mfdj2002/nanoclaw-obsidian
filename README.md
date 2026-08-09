@@ -63,7 +63,7 @@ With a **Shared folder** configured, attaching does the least surprising thing: 
 in that folder is handed over by path (no copy — you both edit the same file), and a file from
 outside is copied into `<shared>/attachments/<thread>/`, where you can see it and delete it
 whenever you like. Without one, files are sent into the agent's private session inbox instead,
-which works but is invisible to you and expires on the retention schedule.
+which works but is invisible to you.
 
 Either way the agent is told the exact path, so "summarize this" works. Whether it can *parse* a given format depends on its container tooling and model:
 
@@ -95,9 +95,6 @@ split. Ask for a chunked pass rather than expecting one shot.
 - **Agent output folder** — where files the agent sends back are written. Put it inside the
   folder mounted into the agent (e.g. `workspace/Andy Files`) so it can re-read and revise its
   own output; anywhere else in the vault is write-only from its side.
-- **Attachment retention (days)** — how long nanoclaw keeps its copies of attached/sent files
-  in session storage. `0` disables cleanup. Lives in the daemon's `.env`
-  (`INBOX_RETENTION_DAYS`), not plugin data, and applies within the hour without a restart.
 - **Models** — one `vendor/model` per line, offered by the picker.
 - **Silence / turn timeouts** — when to finalize after the last reply line / give up on a stalled turn.
 - **Model switch script** — path to `nanoclaw-model.sh` (powers the model picker).
