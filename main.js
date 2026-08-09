@@ -17,7 +17,12 @@ const { exec } = require('child_process');
 const VIEW_TYPE = 'nanoclaw-chat-view';
 
 const DEFAULT_SETTINGS = {
-  socketPath: path.join(os.homedir(), 'cc', 'nanoclaw-v2', 'data', 'obsidian.sock'),
+  // Empty means "not located yet" — filled in by _autodetectInstall. Shipping a
+  // guessed path is worse than shipping none: an install directory can be named
+  // anything, and a wrong-but-plausible default produces "daemon not reachable
+  // at <path>" on a perfectly healthy install, which reads as a broken daemon
+  // rather than a bad setting.
+  socketPath: '',
   silenceMs: 2500,
   agentName: 'andy',
   saveChats: true,
@@ -25,8 +30,8 @@ const DEFAULT_SETTINGS = {
   // Match nanoclaw's container ceiling (30 min). Long research runs are silent on
   // the socket until the final answer, so don't give up early — use Stop to interrupt.
   turnTimeoutMs: 1800000,
-  modelScript: path.join(os.homedir(), 'cc', 'nanoclaw-model.sh'),
-  keyScript: path.join(os.homedir(), 'cc', 'nanoclaw-v2', 'deployment', 'scripts', 'nanoclaw-deepseek-key.sh'),
+  modelScript: '',
+  keyScript: '',
   harvestFolder: 'Web Harvest',
   // Where files the agent sends back are written. The agent never learns this
   // path — it calls send_file and the plugin decides where it lands — which is
@@ -152,7 +157,13 @@ class NanoclawChatPlugin extends Plugin {
   // ── socket transport (one connection, multiplexed by threadId) ────────────
   ensureSocket() {
     if (this.socket && !this.socket.destroyed) return;
-    const sp = expandHome(this.settings.socketPath);
+    const sp = expandHome(this.settings.socketPath || '');
+    if (!sp) {
+      // Nothing located yet. Kick off a scan, but fail this turn honestly rather
+      // than connecting to '' and reporting a cryptic errno.
+      this._autodetectInstall().catch(() => {});
+      throw new Error('no nanoclaw install found yet — Settings → Nanoclaw Chat → Find my install');
+    }
     this.rxbuf = '';
     const s = net.connect(sp);
     this.socket = s;
@@ -591,18 +602,26 @@ class NanoclawChatPlugin extends Plugin {
     workspace.revealLeaf(leaf);
   }
   // ── model choice (fast V4-Flash vs pro V4-Pro) — shells out to nanoclaw-model.sh ──
-  modelEnvPath() { const sp = expandHome(this.settings.socketPath); return path.join(path.dirname(path.dirname(sp)), '.env'); }
+  // <install>/data/obsidian.sock → <install>/.env. Null when the install hasn't
+  // been located, so callers surface "not found" instead of reading '/.env'.
+  modelEnvPath() {
+    const sp = expandHome(this.settings.socketPath || '');
+    return sp ? path.join(path.dirname(path.dirname(sp)), '.env') : null;
+  }
   // nanoclaw's .env is the single source of truth for daemon-side settings, so
   // read and write it in place rather than mirroring the value into plugin data
   // where the two could drift apart.
   readEnvVar(key, fallback) {
     try {
-      const m = new RegExp('^' + key + '=(.*)$', 'm').exec(fs.readFileSync(this.modelEnvPath(), 'utf8'));
+      const envPath = this.modelEnvPath();
+      if (!envPath) return fallback;
+      const m = new RegExp('^' + key + '=(.*)$', 'm').exec(fs.readFileSync(envPath, 'utf8'));
       return m ? m[1].trim() : fallback;
     } catch (e) { return fallback; }
   }
   writeEnvVar(key, value) {
     const p = this.modelEnvPath();
+    if (!p) { new Notice('nanoclaw install not located — run Find my install first'); return false; }
     let env;
     try { env = fs.readFileSync(p, 'utf8'); } catch (e) { new Notice(`can't read ${p}`); return false; }
     const line = `${key}=${value}`;
@@ -614,7 +633,9 @@ class NanoclawChatPlugin extends Plugin {
   // longer says which API a turn will hit.
   currentModel() {
     try {
-      const env = fs.readFileSync(this.modelEnvPath(), 'utf8');
+      const envPath = this.modelEnvPath();
+      if (!envPath) return '?';
+      const env = fs.readFileSync(envPath, 'utf8');
       const m = /^OPENCODE_MODEL=(.+?)\s*$/m.exec(env);
       return m ? m[1].trim() : '?';
     } catch (e) { return '?'; }
@@ -626,7 +647,8 @@ class NanoclawChatPlugin extends Plugin {
     return i > 0 ? full.slice(i + 1) : full;
   }
   setModel(model) {
-    const script = expandHome(this.settings.modelScript);
+    const script = expandHome(this.settings.modelScript || '');
+    if (!script) { new Notice('nanoclaw install not located — Settings → Find my install'); return; }
     if (!fs.existsSync(script)) { new Notice(`model script not found: ${script}`); return; }
     new Notice(`switching model → ${model}…`);
     exec(`/bin/bash ${JSON.stringify(script)} ${JSON.stringify(model)}`, (err, out, errout) => {
@@ -648,7 +670,8 @@ class NanoclawChatPlugin extends Plugin {
   // pick it up on their next API call (OneCLI resolves secrets per request) —
   // no container restart. Pass the key via env to keep it out of `ps`.
   rotateKey(key) {
-    const script = expandHome(this.settings.keyScript);
+    const script = expandHome(this.settings.keyScript || '');
+    if (!script) { new Notice('nanoclaw install not located — Settings → Find my install'); return; }
     if (!fs.existsSync(script)) { new Notice(`key script not found: ${script}`); return; }
     if (!key || !/^sk-/.test(key)) { new Notice("key must look like 'sk-...'"); return; }
     new Notice('rotating DeepSeek key…');
@@ -692,7 +715,10 @@ class NanoclawChatPlugin extends Plugin {
     }).sort((a, b) => (b.hasSock ? 1 : 0) - (a.hasSock ? 1 : 0));
 
     const pick = ranked[0];
-    if (!pick.hasSock && !force) return false;   // don't repoint on a guess
+    // Adopt without a live socket only when there is nothing configured yet —
+    // then there is no working setting to lose. Once a path IS set, require a
+    // live socket, so a stopped daemon on install A can't repoint at install B.
+    if (!pick.hasSock && !force && configured) return false;
     if (pick.sock === configured) {
       if (force) new Notice(`nanoclaw: already pointed at ${pick.inst}${pick.hasSock ? '' : ' (daemon not running)'}`);
       return false;
@@ -869,7 +895,7 @@ class NanoclawSettingTab extends PluginSettingTab {
         finally { b.setDisabled(false).setButtonText('Detect'); }
       }));
     new Setting(containerEl).setName('Socket path').setDesc('nanoclaw obsidian.sock (multi-session channel). Auto-repaired when unreachable.')
-      .addText((t) => t.setValue(this.plugin.settings.socketPath).onChange(async (v) => { this.plugin.settings.socketPath = v.trim(); await this.plugin.saveSettings(); }));
+      .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.socketPath).onChange(async (v) => { this.plugin.settings.socketPath = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Agent name').setDesc('Label shown on agent replies.')
       .addText((t) => t.setValue(this.plugin.settings.agentName).onChange(async (v) => { this.plugin.settings.agentName = v.trim() || 'andy'; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Silence timeout (ms)').setDesc('Finalize a reply after this much quiet following the first line.')
@@ -886,9 +912,9 @@ class NanoclawSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl).setName('Model switch script').setDesc('Path to nanoclaw-model.sh (powers the model picker).')
-      .addText((t) => t.setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
+      .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.modelScript).onChange(async (v) => { this.plugin.settings.modelScript = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Key rotate script').setDesc('Path to nanoclaw-deepseek-key.sh (powers the "Rotate DeepSeek API key" command).')
-      .addText((t) => t.setValue(this.plugin.settings.keyScript).onChange(async (v) => { this.plugin.settings.keyScript = v.trim(); await this.plugin.saveSettings(); }));
+      .addText((t) => t.setPlaceholder('(auto-detected)').setValue(this.plugin.settings.keyScript).onChange(async (v) => { this.plugin.settings.keyScript = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Agent output folder').setDesc(`Vault folder where files ${this.plugin.settings.agentName} sends back are written (via send_file). Put it INSIDE the folder mounted into the agent (e.g. "workspace/${this.plugin.settings.agentName} Files") if you want it to be able to re-read and revise its own output — anywhere else in the vault is write-only from its side.`)
       .addText((tx) => tx.setValue(this.plugin.settings.outputFolder).onChange(async (v) => { this.plugin.settings.outputFolder = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Attachment retention (days)')

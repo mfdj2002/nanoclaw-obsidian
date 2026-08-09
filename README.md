@@ -76,7 +76,10 @@ split. Ask for a chunked pass rather than expecting one shot.
 - **Find my install** — scans your home folder for a nanoclaw install and points the paths
   at it. The defaults are only a guess: an install directory can be named anything, so the
   plugin also re-scans automatically whenever the socket turns out to be unreachable.
-- **Socket path** — `<install>/data/obsidian.sock`. Auto-repaired when unreachable.
+- **Socket path** — `<install>/data/obsidian.sock`. Blank means "not located yet"; the plugin
+  fills it in and re-detects whenever it becomes unreachable. There is deliberately no default
+  path: an install directory can be named anything, and a wrong-but-plausible guess reports a
+  healthy daemon as unreachable.
 - **Agent name** — label on replies.
 - **Chats folder** — where conversation `.md` notes are saved.
 - **Agent output folder** — where files the agent sends back are written. Put it inside the
