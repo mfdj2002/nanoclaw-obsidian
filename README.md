@@ -87,7 +87,10 @@ split. Ask for a chunked pass rather than expecting one shot.
   healthy daemon as unreachable.
 - **Agent name** — label on replies.
 - **Chats folder** — where conversation `.md` notes are saved.
-- **Shared folder** — a vault folder that is *also* mounted into the agent (set up by
+- **Shared folder** — vault-relative (`shared-with-agent`). An absolute path inside the vault
+  (`/Users/you/vault/shared-with-agent`) is accepted too and normalised — the socket/script
+  settings above are absolute host paths, so reaching for one here is an easy mistake.
+  A vault folder that is *also* mounted into the agent (set up by
   `nanoclaw-mount-vault.sh`, which gives it the same name on both sides). When set, attaching
   a file puts it here rather than in the agent's private session inbox, and a file already in
   here is handed over **by path, not by copy** — so the agent edits the same bytes you see.

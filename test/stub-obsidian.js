@@ -22,11 +22,12 @@ const notices = [];
 class Notice { constructor(msg) { notices.push(String(msg)); } }
 
 /** In-memory vault: path -> Buffer for files, path -> null for folders. */
-function makeVault(initial = {}) {
+function makeVault(initial = {}, basePath = '/Users/kite/cc/nano-test') {
   const files = new Map(Object.entries(initial).map(([p, v]) => [p, Buffer.from(v)]));
   const folders = new Set();
   const tfile = (p) => ({ path: p, name: p.split('/').pop(), extension: (p.split('.').pop() || '') });
   return {
+    adapter: { basePath },
     _files: files,
     _folders: folders,
     getAbstractFileByPath(p) {

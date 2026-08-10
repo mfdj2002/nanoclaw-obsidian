@@ -233,7 +233,7 @@ class NanoclawChatPlugin extends Plugin {
   }
 
   async saveAgentFiles(files) {
-    const folder = (this.settings.outputFolder || '').replace(/\/+$/, '');
+    const folder = this.toVaultRelative(this.settings.outputFolder);
     if (folder) await this.ensureFolder(folder);
     const out = [];
     for (const f of files) {
@@ -421,15 +421,38 @@ class NanoclawChatPlugin extends Plugin {
   }
   stop(threadId) { const t = this.threads.get(threadId); if (t && t.inFlight) this.finalize(threadId, 'stopped'); }
 
+  /** Absolute path of the vault on disk, or '' if unavailable. */
+  vaultBasePath() {
+    try {
+      const a = this.app.vault.adapter;
+      return String((a && (a.basePath || (a.getBasePath && a.getBasePath()))) || '').replace(/\/+$/, '');
+    } catch (e) { return ''; }
+  }
+
+  /**
+   * Folder settings are vault-relative, because that is what Obsidian's own
+   * file paths are. But the neighbouring socket/script settings are absolute
+   * host paths, so reaching for an absolute path here is a natural mistake —
+   * and one that fails silently, since an absolute value simply never matches
+   * and every attachment quietly takes the inbox fallback. Accept both.
+   */
+  toVaultRelative(p) {
+    let v = String(p || '').trim().replace(/\/+$/, '');
+    if (!v) return '';
+    const base = this.vaultBasePath();
+    if (base && (v === base || v.startsWith(base + '/'))) v = v.slice(base.length);
+    return v.replace(/^\/+/, '');
+  }
+
   /** Container path of the shared folder. mount-vault.sh mounts <vault>/<name>
    *  at /workspace/extra/<name>, same leaf both sides, so this is derivable. */
   sharedContainerRoot() {
-    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    const f = this.toVaultRelative(this.settings.sharedFolder);
     return f ? '/workspace/extra/' + f.split('/').pop() : null;
   }
   /** Vault path → the path the agent opens, or null if outside the shared folder. */
   containerPathFor(vaultPath) {
-    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    const f = this.toVaultRelative(this.settings.sharedFolder);
     const root = this.sharedContainerRoot();
     if (!f || !root) return null;
     if (vaultPath !== f && !vaultPath.startsWith(f + '/')) return null;
@@ -489,7 +512,7 @@ class NanoclawChatPlugin extends Plugin {
    * the base64/inbox path.
    */
   async _stageInShared(threadId, name, buf) {
-    const f = (this.settings.sharedFolder || '').replace(/^\/+|\/+$/g, '');
+    const f = this.toVaultRelative(this.settings.sharedFolder);
     if (!f) return false;
     const dir = `${f}/attachments/${threadId}`;
     try {
@@ -986,7 +1009,7 @@ class NanoclawSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('Shared folder')
       .setDesc('Vault folder that is also mounted into the agent (set up by nanoclaw-mount-vault.sh). When set, attached files land here instead of the agent\'s private inbox — one copy, visible to you, editable by both. Leave blank to use the inbox.')
       .addText((tx) => tx.setPlaceholder('shared-with-agent').setValue(this.plugin.settings.sharedFolder).onChange(async (v) => {
-        this.plugin.settings.sharedFolder = v.trim().replace(/^\/+|\/+$/g, '');
+        this.plugin.settings.sharedFolder = this.plugin.toVaultRelative(v);
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl).setName('Agent output folder').setDesc(`Vault folder where files ${this.plugin.settings.agentName} sends back are written (via send_file). Put it INSIDE the folder mounted into the agent (e.g. "workspace/${this.plugin.settings.agentName} Files") if you want it to be able to re-read and revise its own output — anywhere else in the vault is write-only from its side.`)

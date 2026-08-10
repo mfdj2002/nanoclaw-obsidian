@@ -50,6 +50,32 @@ function fakeFile(name, content, type = '') {
   return { name, size: b.length, type, arrayBuffer: async () => ab };
 }
 
+test('an absolute path inside the vault is accepted for the shared folder', async () => {
+  // The neighbouring socket/script settings ARE absolute host paths, so reaching
+  // for one here is a natural mistake — and it used to fail silently, dropping
+  // every attachment into the inbox instead.
+  const p = makePlugin({ sharedFolder: '/Users/kite/cc/nano-test/shared-with-agent' }, { 'shared-with-agent/ping.md': 'hi' });
+
+  await p.attachFromVault(THREAD, p.app.vault.getAbstractFileByPath('shared-with-agent/ping.md'));
+
+  const a = staged(p)[0];
+  assert.equal(a.shared, true, 'absolute form must behave the same as vault-relative');
+  assert.equal(a.containerPath, '/workspace/extra/shared-with-agent/ping.md');
+});
+
+test('a trailing slash on the shared folder is tolerated', async () => {
+  const p = makePlugin({ sharedFolder: 'shared-with-agent/' }, { 'shared-with-agent/ping.md': 'hi' });
+  await p.attachFromVault(THREAD, p.app.vault.getAbstractFileByPath('shared-with-agent/ping.md'));
+  assert.equal(staged(p)[0].containerPath, '/workspace/extra/shared-with-agent/ping.md');
+});
+
+test('an absolute path OUTSIDE the vault is not silently treated as inside it', async () => {
+  const p = makePlugin({ sharedFolder: '/somewhere/else/shared-with-agent' }, { 'shared-with-agent/ping.md': 'hi' });
+  await p.attachFromVault(THREAD, p.app.vault.getAbstractFileByPath('shared-with-agent/ping.md'));
+  // Falls back to staging a copy rather than inventing a container path.
+  assert.notEqual(staged(p)[0].vaultPath, 'shared-with-agent/ping.md');
+});
+
 test('a file already in the shared folder is handed over by path, not copied', async () => {
   const p = makePlugin({ sharedFolder: 'shared-with-agent' }, { 'shared-with-agent/ping.md': 'hi' });
   const before = p.app.vault._files.size;
