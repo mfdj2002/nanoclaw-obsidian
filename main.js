@@ -394,8 +394,14 @@ class NanoclawChatPlugin extends Plugin {
     const label = text || staged[0].name;
     if (t.messages.length === 0) t.title = label.slice(0, 24) + (label.length > 24 ? '…' : '');
     // Note attachments in the persisted turn too, so the saved chat note doesn't
-    // read as a question about a document that appears out of nowhere.
-    t.pendingUser = text + (staged.length ? `\n\n[attached: ${staged.map((a) => a.name).join(', ')}]` : '');
+    // read as a question about a document that appears out of nowhere. Anything
+    // that lives in the vault is written as a full vault-relative wikilink, so
+    // it's clickable from the saved note. A file that went to the session inbox
+    // has no vault path to link to, so it stays a bare name.
+    const attachNote = staged.length
+      ? '\n\nattached: ' + staged.map((a) => (a.vaultPath ? `[[${a.vaultPath}]]` : a.name)).join(', ')
+      : '';
+    t.pendingUser = text + attachNote;
     t.messages.push({ role: 'you', text, files: staged.map((a) => a.name) });
     t.messages.push({ role: 'agent', text: '…thinking', pending: true });
     t.inFlight = true; t.started = false; t.acc = ''; t.t0 = Date.now();

@@ -190,6 +190,35 @@ test('the staging tray is cleared after a send', async () => {
   assert.equal(t.attach.length, 0, 'else the next message re-sends the same file');
 });
 
+test('the saved turn links attachments by full vault path, so they are clickable', async () => {
+  const p = makePlugin({ sharedFolder: 'shared-with-agent' }, { 'shared-with-agent/ping.md': 'hi' });
+  p.ensureSocket = () => { p.socket = { write: () => {} }; };
+
+  await p.attachFromVault(THREAD, p.app.vault.getAbstractFileByPath('shared-with-agent/ping.md'));
+  await p.attachFromFile(THREAD, fakeFile('report.pdf', '%PDF'));
+  p.sendMessage(THREAD, 'summarize these');
+
+  const t = p.threads.get(THREAD);
+  clearInterval(t.ticker); clearTimeout(t.timer);
+
+  assert.match(t.pendingUser, /\[\[shared-with-agent\/ping\.md\]\]/);
+  assert.match(t.pendingUser, new RegExp(`\\[\\[shared-with-agent/attachments/${THREAD}/report\\.pdf\\]\\]`));
+});
+
+test('an inbox-only attachment stays a bare name, since there is nothing to link to', async () => {
+  const p = makePlugin({ sharedFolder: '' });
+  p.ensureSocket = () => { p.socket = { write: () => {} }; };
+
+  await p.attachFromFile(THREAD, fakeFile('report.pdf', '%PDF'));
+  p.sendMessage(THREAD, 'read this');
+
+  const t = p.threads.get(THREAD);
+  clearInterval(t.ticker); clearTimeout(t.timer);
+
+  assert.match(t.pendingUser, /attached: report\.pdf/);
+  assert.ok(!t.pendingUser.includes('[['), 'must not fabricate a link to a file that is not in the vault');
+});
+
 test('a file the agent already wrote is not duplicated when it is also sent', async () => {
   const p = makePlugin({ outputFolder: 'Andy Files' }, { 'Andy Files/report.md': 'same bytes' });
 
